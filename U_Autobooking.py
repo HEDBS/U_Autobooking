@@ -1,0 +1,1681 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+U_Autobooking · 浴室自动预约系统
+
+功能概述
+--------
+本程序用于 h5.hydream.cn（浴室预约系统）的自动化操作，提供两类自动化：
+
+  1. 空闲预约：监控指定浴室的空闲位置数量，当数量满足设定条件时自动完成预约。
+  2. 排队预约：当浴室满员、系统进入排队模式时，监控当前排队人数，
+     人数满足设定条件时自动加入排队，并持续跟踪排队结果，
+     排到位置后报告预约的浴室与位置编号。
+
+运行方式
+--------
+直接运行本文件即可，全部操作通过菜单完成，不需要命令行参数。
+首次运行会引导完成登录与参数配置；配置完成后支持快速启动。
+
+生成文件
+--------
+U_Autobooking_state.json  运行配置与登录状态（程序自动维护，无需手工编辑）
+U_Autobooking.log         运行日志
+
+运行环境：Python 3.7 及以上，仅使用标准库。
+"""
+
+import base64
+import getpass
+import http.cookiejar
+import json
+import os
+import random
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+
+VERSION = "1.0"
+PROJECT = "U_Autobooking"
+
+# ============================================================ 路径 / 常量
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_PATH = os.path.join(BASE_DIR, "U_Autobooking_state.json")
+LOG_PATH = os.path.join(BASE_DIR, "U_Autobooking.log")
+
+API_BASE = "https://lz.hydream.cn/api/v1/"
+PAGE_HOST = "https://h5.hydream.cn"
+
+UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 "
+      "(KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1")
+
+DEFAULT_STATE = {
+    "account": "",
+    "password": "",
+    "org_area_id": None,
+    "device_type_key": None,
+    "device_type_name": "",
+    "targets": [],              # [{"area_id": 12, "area_name": "4号楼1层（男）"}]
+    "threshold": 1,             # 空闲触发阈值
+    "condition": "le",          # le / eq / ge
+    "auto_queue": True,         # 是否启用排队自动预约
+    "queue_threshold": 2,       # 排队人数阈值
+    "queue_condition": "le",    # le / eq / ge
+    "queue_max_wait_min": 0,    # 排队最长等待（分钟），0 = 不限
+    "poll_interval": 8,         # 检测周期（秒）
+    "fast_start_seconds": 5,    # 配置完备时的快速启动倒计时（秒），0 = 直接启动
+    "auto_health_log": True,    # 自动提交体温登记（部分校区预约前置条件）
+    "temperature": "36.01",
+    "notify_cmd": "",           # 结果通知命令，消息内容见环境变量 HY_DREAM_MSG
+    "session": {},
+}
+
+# 接口字段兼容：不同校区/版本可能使用不同命名
+IDLE_KEYS = ["idleNum", "idle_num", "idleDeviceNum", "freeNum", "free_num", "freeCount",
+             "idleCount", "canUseNum", "remainingNum", "remainNum"]
+TOTAL_KEYS = ["totalNum", "total_num", "deviceNum", "device_num", "device_number",
+              "deviceNumber", "totalCount", "total"]
+WAIT_KEYS = ["queuingNumber", "queueingNumber", "queuing_number", "queueing_number",
+             "waitingNumber", "waitingCount", "waitNum", "wait_num", "queueNum",
+             "queueCount", "queue_num", "waiting_num", "peopleNum", "people_num"]
+POSITION_KEYS = ["queuingNumber", "queueingNumber", "position", "queuePosition", "queue_position",
+                 "waitingNumber", "index", "no", "number"]
+READY_STATES = {"ready", "normal", "idle", "free"}
+
+_LOG_DISABLED = False   # 自检等场景下临时关闭日志写入
+_STATUS_CACHE = {"at": 0.0, "key": "", "lines": []}   # 主页面实时状态缓存
+
+
+# ============================================================ 输出 / 界面
+
+def out(msg="", level="INFO"):
+    line = msg if level == "RAW" else "[%s] %-5s %s" % (
+        datetime.now().strftime("%H:%M:%S"), level, msg)
+    print(line, flush=True)
+    if level != "RAW" and not _LOG_DISABLED:
+        try:
+            with open(LOG_PATH, "a", encoding="utf-8") as f:
+                f.write("[%s] %-5s %s\n" % (
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"), level, msg))
+        except OSError:
+            pass
+
+
+def can_interact():
+    try:
+        return bool(sys.stdin) and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
+def clear():
+    """清屏，保证界面干净（仅供交互模式使用）。"""
+    if not can_interact():
+        return
+    try:
+        if os.name == "nt":
+            os.system("cls")
+        else:
+            sys.stdout.write("\033[2J\033[3J\033[H")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+def banner():
+    print("=" * 62)
+    print("  %s  浴室自动预约系统  v%s" % (PROJECT, VERSION))
+    print("=" * 62)
+
+
+def title(text):
+    print()
+    print("  【%s】" % text)
+    print("-" * 62)
+
+
+def line(text=""):
+    print(("  " + text) if text else "")
+
+
+# ============================================================ 输入
+
+class NoInput(Exception):
+    """无法获取键盘输入（无控制台环境）。"""
+
+
+def ask(prompt, default=None):
+    suffix = "（回车 = %s）" % default if default not in (None, "") else ""
+    try:
+        raw = input("  %s%s：" % (prompt, suffix)).strip()
+    except EOFError:
+        raise NoInput()
+    if not raw and default is not None:
+        return str(default)
+    return raw
+
+
+def ask_secret(prompt):
+    """读取密码。有控制台时不回显，无控制台时降级为普通输入。"""
+    if not can_interact():
+        return ask(prompt)
+    try:
+        return getpass.getpass("  %s（输入不显示）：" % prompt).strip()
+    except Exception:
+        return ask(prompt)
+
+
+def ask_choice(prompt, options, default=1):
+    """options: [(编号, 标题, 说明)]，返回选中的编号字符串。"""
+    for key, name, desc in options:
+        mark = "   （默认）" if str(key) == str(default) else ""
+        desc_text = ("   —— " + desc) if desc else ""
+        print("   %s) %s%s%s" % (key, name, desc_text, mark))
+    while True:
+        raw = ask(prompt, default=str(default))
+        if raw in [str(k) for k, _, _ in options]:
+            return raw
+        print("   输入无效，请填写上方编号。")
+
+
+def pause(text="按回车返回上级菜单"):
+    try:
+        input("  %s…" % text)
+    except (EOFError, KeyboardInterrupt):
+        raise NoInput()
+
+
+def confirm(prompt, default_yes=False):
+    default = "是" if default_yes else "否"
+    raw = ask("%s（是/否）" % prompt, default=default)
+    return raw.strip() in ("是", "y", "Y", "yes", "1", "确认")
+
+
+# ============================================================ 配置持久化
+
+def load_state(path=STATE_PATH):
+    state = dict(DEFAULT_STATE)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                state.update(data)
+        except (OSError, ValueError) as e:
+            out("配置文件读取失败（%s），已使用默认配置" % e, "WARN")
+    return state
+
+
+def save_state(state, path=STATE_PATH):
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+        return True
+    except OSError as e:
+        out("配置保存失败：%s" % e, "ERROR")
+        return False
+
+
+def is_configured(state):
+    return bool(state.get("account") and state.get("password") and state.get("targets"))
+
+
+# ============================================================ 接口客户端
+
+class ApiError(Exception):
+    def __init__(self, code, msg, raw=""):
+        super().__init__("code=%s %s" % (code, msg))
+        self.code = code
+        self.msg = str(msg)
+
+
+class NotLoggedIn(ApiError):
+    pass
+
+
+class NetworkError(Exception):
+    pass
+
+
+class HydreamClient:
+    def __init__(self, timeout=20, debug=False):
+        self.timeout = timeout
+        self.debug = debug
+        self.session_name = ""
+        self.session_id = ""
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+        self.headers = {
+            "User-Agent": UA,
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+            "Origin": PAGE_HOST,
+            "Referer": PAGE_HOST + "/index_list.html",
+            "X-Requested-With": "XMLHttpRequest",
+            "Connection": "keep-alive",
+        }
+
+    # ---- 底层请求 ------------------------------------------------------
+
+    def _post(self, url, data):
+        body = urllib.parse.urlencode(data).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=self.headers, method="POST")
+        try:
+            with self.opener.open(req, timeout=self.timeout) as resp:
+                return resp.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as e:
+            raise NetworkError("服务器返回 HTTP %s" % e.code)
+        except urllib.error.URLError as e:
+            raise NetworkError("无法连接服务器：%s" % e.reason)
+        except OSError as e:
+            raise NetworkError("网络异常：%s" % e)
+
+    @staticmethod
+    def _parse(raw):
+        txt = (raw or "").strip()
+        if not txt:
+            raise ApiError(-1, "服务器返回内容为空")
+        if txt[0] in "{[":
+            return json.loads(txt)
+        if "Access Denied" in txt:
+            raise ApiError(-2, "请求被网站安全策略拦截")
+        try:
+            clean = re.sub(r"[^A-Za-z0-9+/=]", "", txt)
+            clean += "=" * (-len(clean) % 4)
+            return json.loads(base64.b64decode(clean).decode("utf-8", "replace"))
+        except Exception:
+            raise ApiError(-3, "服务器返回内容无法识别：%s" % txt[:120])
+
+    def api(self, mod, act, data=None, retries=3):
+        payload = dict(data or {})
+        payload["isWeb"] = 1
+        url = API_BASE + mod + "/" + act
+        if self.session_id:
+            url += "?PHPSESSID=" + urllib.parse.quote(self.session_id)
+
+        parsed, last = None, None
+        for attempt in range(1, retries + 1):
+            try:
+                parsed = self._parse(self._post(url, payload))
+                break
+            except NetworkError as e:
+                last = e
+                out("网络请求失败（第 %d/%d 次）：%s" % (attempt, retries, e), "WARN")
+                time.sleep(2 * attempt)
+            except ApiError as e:
+                if e.code == -2 and attempt < retries:
+                    last = e
+                    out("请求被安全策略拦截（第 %d/%d 次），正在重试" % (attempt, retries), "WARN")
+                    time.sleep(2 * attempt)
+                    continue
+                raise
+        if parsed is None:
+            raise NetworkError("重试 %d 次后仍失败：%s" % (retries, last))
+
+        if self.debug:
+            out("接口 %s/%s 返回：%s" % (
+                mod, act, json.dumps(parsed, ensure_ascii=False)[:400]), "DEBUG")
+
+        inner = parsed.get("data") if isinstance(parsed, dict) else None
+        if not isinstance(inner, dict) or "code" not in inner:
+            raise ApiError(-4, "接口返回格式异常：%s" % json.dumps(parsed, ensure_ascii=False)[:150])
+        if inner.get("code") != 200:
+            msg = inner.get("msg") or inner.get("message") or ""
+            if str(inner.get("code")) in ("100090", "100091"):
+                raise NotLoggedIn(inner["code"], msg)
+            raise ApiError(inner["code"], msg)
+        return inner.get("data")
+
+    # ---- 会话 ----------------------------------------------------------
+
+    def set_cookie(self, name, value):
+        self.jar.set_cookie(http.cookiejar.Cookie(
+            version=0, name=name, value=str(value), port=None, port_specified=False,
+            domain=".hydream.cn", domain_specified=True, domain_initial_dot=True,
+            path="/", path_specified=True, secure=False, expires=None, discard=False,
+            comment=None, comment_url=None, rest={}, rfc2109=False))
+
+    def login(self, account, password):
+        payload = self.api("UserApi", "loginWidthPwd", {"mobile": account, "pwd": password})
+        if not isinstance(payload, dict):
+            raise ApiError(-5, "登录接口返回异常")
+        sname, sid = payload.get("sessionName"), payload.get("sessionId")
+        if sname and sid:
+            self.session_name, self.session_id = sname, str(sid)
+            self.set_cookie(sname, sid)
+        else:
+            for c in self.jar:
+                if c.name.upper() == "PHPSESSID":
+                    self.session_name, self.session_id = "PHPSESSID", c.value
+        return payload
+
+    def dump_session(self):
+        return {"name": self.session_name, "id": self.session_id, "saved_at": time.time(),
+                "cookies": [{"name": c.name, "value": c.value, "domain": c.domain,
+                             "path": c.path} for c in self.jar]}
+
+    def restore_session(self, session):
+        if not isinstance(session, dict):
+            return False
+        for c in session.get("cookies") or []:
+            try:
+                self.set_cookie(c.get("name"), c.get("value"))
+            except Exception:
+                pass
+        self.session_name = session.get("name", "")
+        self.session_id = str(session.get("id") or "")
+        return bool(self.session_id or session.get("cookies"))
+
+
+# ============================================================ 数据整理
+
+def pick_field(row, keys):
+    for k in keys:
+        if k in row and row[k] not in (None, ""):
+            try:
+                return int(float(row[k]))
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def normalize_areas(rows, meta=None):
+    meta = meta or {}
+    result = []
+    for i, row in enumerate(rows or []):
+        if not isinstance(row, dict):
+            continue
+        aid = row.get("device_area_id", row.get("deviceAreaId"))
+        name = (row.get("device_area_name") or row.get("deviceAreaName")
+                or meta.get(aid) or ("浴室%s" % aid))
+        name = str(name).strip()
+        result.append({"index": i, "id": aid, "name": name,
+                       "idle": pick_field(row, IDLE_KEYS),
+                       "total": pick_field(row, TOTAL_KEYS),
+                       "waiting": pick_field(row, WAIT_KEYS),
+                       "raw": row})
+    return result
+
+
+def matched(value, threshold, condition):
+    if value is None:
+        return False
+    c = (condition or "le").lower()
+    if c in ("le", "<="):
+        return value <= threshold
+    if c in ("eq", "=="):
+        return value == threshold
+    if c in ("ge", ">="):
+        return value >= threshold
+    if c == "lt":
+        return value < threshold
+    if c == "gt":
+        return value > threshold
+    raise ValueError("条件参数无效：%r" % condition)
+
+
+def cond_text(condition, threshold, subject="空闲位置"):
+    tpl = {"le": "%s 不超过 %d 时", "eq": "%s 恰好为 %d 时",
+           "ge": "%s 达到 %d 及以上时", "lt": "%s 少于 %d 时",
+           "gt": "%s 多于 %d 时"}.get(condition, "%s 为 %d 时")
+    return tpl % (subject, threshold)
+
+
+def ts_text(value):
+    try:
+        return datetime.fromtimestamp(int(value)).strftime("%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OSError):
+        return str(value or "未知")
+
+
+# ============================================================ 业务核心
+
+class Bot:
+    def __init__(self, client, state):
+        self.c = client
+        self.state = state
+        self.user = {}
+        self.org_area_id = None
+        self.device_type_key = None
+        self.last_msg_id = 0
+        self._area_meta_unsupported = False
+        self.check_body_temperature = None   # 该校区是否需要体温登记（None = 未知）
+
+    # ---- 基础信息 ------------------------------------------------------
+
+    def whoami(self):
+        self.user = self.c.api("UserApi", "getUserInfo") or {}
+        out("账号：%s（%s）  账户余额：%s" % (
+            self.user.get("user_nickname") or self.user.get("user_login") or "未命名",
+            self.user.get("mobile") or "无手机号",
+            self.user.get("available_balance") or "0.00"))
+        return self.user
+
+    def device_types(self):
+        return self.c.api("DeviceAreaApi", "selectDeviceTypeByOrgAreaId",
+                          {"orgAreaId": self.org_area_id}) or []
+
+    def areas(self, retries=3):
+        rows = self.c.api("DeviceAreaApi", "selectDeviceAreasWithDeviceState",
+                          {"orgAreaId": self.org_area_id,
+                           "deviceTypeKey": self.device_type_key}, retries=retries) or []
+        meta = {}
+        if not self._area_meta_unsupported:      # 部分站点无此接口，只尝试一次
+            try:
+                for r in self.c.api("DeviceAreaApi", "selectDeviceAreas",
+                                    {"orgAreaId": self.org_area_id}) or []:
+                    meta[r.get("device_area_id")] = r.get("device_area_name")
+            except ApiError:
+                self._area_meta_unsupported = True
+        return normalize_areas(rows, meta)
+
+    def resolve_org_area(self):
+        self.org_area_id = self.state.get("org_area_id") or self.user.get("default_org_area_id")
+        if not self.org_area_id or str(self.org_area_id) == "0":
+            raise ApiError(-8, "账号未绑定校区，请先在 h5.hydream.cn 上选择校区后重试")
+        self.state["org_area_id"] = self.org_area_id
+        return self.org_area_id
+
+    def resolve_device_type(self, interactive=False):
+        types = self.device_types()
+        if not types:
+            raise ApiError(-6, "该校区暂无可用的设备类型")
+        saved = self.state.get("device_type_key")
+        if saved and any(t.get("device_type_key") == saved for t in types):
+            self.device_type_key = saved
+            return self.device_type_key
+        if not interactive:
+            pick = next((t for t in types if str(t.get("need_reserve")) == "1"), types[0])
+            self.device_type_key = pick.get("device_type_key")
+            return self.device_type_key
+
+        title("选择设备类型")
+        options = []
+        default = 1
+        for i, t in enumerate(types, 1):
+            need = str(t.get("need_reserve")) == "1"
+            options.append((i, "%s（%s）" % (t.get("device_type_name") or t.get("device_type_key"),
+                                             "需预约" if need else "可直接使用"), ""))
+            if need and default == 1:
+                default = i
+        idx = int(ask_choice("请选择设备类型", options, default))
+        chosen = types[idx - 1]
+        self.device_type_key = chosen.get("device_type_key")
+        self.state["device_type_key"] = self.device_type_key
+        self.state["device_type_name"] = chosen.get("device_type_name") or self.device_type_key
+        return self.device_type_key
+
+    # ---- 预约 ----------------------------------------------------------
+
+    def health_log(self):
+        if not self.state.get("auto_health_log"):
+            return
+        if self.check_body_temperature is False:   # 该校区不需要体温登记
+            return
+        try:
+            self.c.api("HealthApi", "createLog",
+                       {"bodyTemperature": str(self.state.get("temperature", "36.01")),
+                        "deviceTypeKey": self.device_type_key})
+        except ApiError as e:
+            out("体温登记未成功（不影响后续操作）：%s" % e, "WARN")
+
+    def pick_ready_device(self, area_id):
+        devices = self.c.api("DeviceAreaApi", "selectDevicesByAreaId",
+                             {"deviceAreaId": area_id,
+                              "deviceTypeKey": self.device_type_key}) or []
+        ready = [d for d in devices if str(d.get("device_status", "")).lower() in READY_STATES]
+        return random.choice(ready) if ready else None
+
+    def reserve(self, area_id, area_name):
+        device = self.pick_ready_device(area_id)
+        if device is None:
+            out("当前未读取到空闲位置（可能刚刚被占用），本轮跳过", "WARN")
+            return None
+        device_name = device.get("device_name") or device.get("device_key")
+        line("选中位置：%s" % device_name)
+        self.health_log()
+        result = self.c.api("DeviceApi", "reserve", {"uuid": device["device_key"]}) or {}
+        return {"area_id": area_id, "area_name": area_name, "device": device, "result": result}
+
+    # ---- 排队 / 状态总线 -----------------------------------------------
+
+    def bus_messages(self, area_id, retries=3):
+        """通过 BusApi 获取浴室实时状态（排队人数、本人状态）。"""
+        params = {"deviceAreaId": area_id, "deviceTypeKey": self.device_type_key,
+                  "time": int(time.time()), "lastId": self.last_msg_id}
+        data = self.c.api("BusApi", "exchangeMsg", params, retries=retries)
+        if isinstance(data, dict):
+            data = data.get("list") or data.get("data") or data.get("messages") or []
+        if not isinstance(data, list):
+            return []
+        for m in data:
+            if isinstance(m, dict):
+                try:
+                    self.last_msg_id = max(self.last_msg_id, int(m.get("id") or 0))
+                except (TypeError, ValueError):
+                    pass
+        return [m for m in data if isinstance(m, dict)]
+
+    @staticmethod
+    def _content(msg):
+        return Bot._as_dict(msg.get("content", msg.get("data")))
+
+    @staticmethod
+    def _as_dict(value):
+        """接口中的明细字段可能是对象，也可能是 JSON 字符串或空字符串。"""
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip().startswith("{"):
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except ValueError:
+                return {}
+        return {}
+
+    def waiting_count(self, messages, area_row=None):
+        """排队人数：优先取总线的 waitingInfo，其次取浴室状态字段。"""
+        for m in messages:
+            if m.get("type") == "waitingInfo":
+                n = pick_field(self._content(m), WAIT_KEYS)
+                if n is not None:
+                    return n
+        for m in messages:                       # 部分版本把排队信息放在 indexTip 里
+            if m.get("type") in ("indexTip", "queueInfo"):
+                n = pick_field(self._content(m), WAIT_KEYS)
+                if n is not None:
+                    return n
+        for m in messages:
+            c = self._content(m)
+            n = pick_field(c, WAIT_KEYS)
+            if n is not None and m.get("type") in (None, "waitingInfo", "userState"):
+                return n
+        return (area_row or {}).get("waiting")
+
+    def my_status(self, messages):
+        """本人状态：normal / queuing / reserved / running，附带明细。"""
+        for m in messages:
+            if m.get("type") == "userState":
+                c = self._content(m)
+                return {"state": c.get("userState") or c.get("state") or "",
+                        "queue": self._as_dict(c.get("queueInfo")),
+                        "device": self._as_dict(c.get("deviceInfo")),
+                        "remain": c.get("remainTime"),
+                        "raw": c}
+        return {}
+
+    def queue_up(self, area_id):
+        self.health_log()
+        return self.c.api("DeviceAreaApi", "queueUp",
+                          {"deviceAreaId": area_id,
+                           "deviceTypeKey": self.device_type_key}) or {}
+
+    def cancel_queue(self, area_id):
+        try:
+            return self.c.api("DeviceAreaApi", "cancelQueue",
+                              {"deviceAreaId": area_id,
+                               "deviceTypeKey": self.device_type_key}) or {}
+        except ApiError as e:
+            out("取消排队未成功：%s" % e, "WARN")
+            return {}
+
+    # ---- 结果确认 ------------------------------------------------------
+
+    def confirm_reservation(self, info):
+        """读取总线确认预约结果，返回确认信息（可能为空）。"""
+        area_id = info.get("area_id") or (self.state.get("targets") or [{}])[0].get("area_id")
+        try:
+            messages = self.bus_messages(area_id)
+        except (ApiError, NetworkError):
+            return {}
+        status = self.my_status(messages)
+        device = status.get("device") or {}
+        if status.get("state") in ("reserved", "running") and device:
+            return {"area_name": device.get("deviceAreaName") or device.get("device_area_name"),
+                    "device_number": device.get("deviceNumber") or device.get("device_number"),
+                    "state": status.get("state")}
+        return {}
+
+    # ---- 监控主循环 ----------------------------------------------------
+
+    def bootstrap(self, verbose=True):
+        """进入监控前的必要初始化：账号、校区、设备类型。"""
+        if not self.user:
+            self.user = self.c.api("UserApi", "getUserInfo") or {}
+        if not self.org_area_id:
+            self.org_area_id = self.state.get("org_area_id") or self.user.get("default_org_area_id")
+        if not self.org_area_id or str(self.org_area_id) == "0":
+            raise ApiError(-8, "账号未绑定校区，请先在 h5.hydream.cn 上选择校区后重试")
+        self.state["org_area_id"] = self.org_area_id
+        if not self.device_type_key:
+            self.resolve_device_type(interactive=False)
+        if self.check_body_temperature is None:
+            try:
+                setting = self.c.api("UserApi", "getSetting") or {}
+                self.check_body_temperature = str(
+                    setting.get("checkBodyTemperature", "0")) in ("1", "true")
+                if verbose:
+                    out("站点设置：体温登记 %s，实时状态推送 %s" % (
+                        "需要" if self.check_body_temperature else "不需要",
+                        "已启用" if str(setting.get("enableDistributedEvent", "0")) != "0" else "未启用"))
+            except ApiError:
+                self.check_body_temperature = True   # 读取失败时按需要处理，避免漏登记
+        return True
+
+    def monitor(self, continuous=False):
+        targets = self.state.get("targets") or []
+        if not targets:
+            out("尚未配置目标浴室，请先进入「修改运行设置」完成配置", "ERROR")
+            return False
+        self.bootstrap()
+        threshold = int(self.state.get("threshold", 1))
+        condition = self.state.get("condition", "le")
+        interval = max(3.0, float(self.state.get("poll_interval", 8)))
+        auto_queue = bool(self.state.get("auto_queue"))
+        q_threshold = int(self.state.get("queue_threshold", 2))
+        q_condition = self.state.get("queue_condition", "le")
+
+        title("自动预约监控已启动")
+        line("目标浴室：%s" % "、".join(t["area_name"] for t in targets))
+        line("空闲触发：%s 自动预约" % cond_text(condition, threshold, "空闲位置"))
+        line("排队触发：%s" % (cond_text(q_condition, q_threshold, "排队人数") + " 自动排队"
+                            if auto_queue else "未启用"))
+        line("检测周期：每 %.0f 秒" % interval)
+        line("按 Ctrl+C 可随时终止")
+        print("-" * 62)
+
+        rounds = 0
+        while True:
+            rounds += 1
+            try:
+                areas = {str(a["id"]): a for a in self.areas()}
+                for target in targets:
+                    row = areas.get(str(target["area_id"]))
+                    if row is None:
+                        out("第 %d 轮：%s 不在可用列表中，本轮跳过" % (rounds, target["area_name"]), "WARN")
+                        continue
+                    idle, total = row["idle"], row["total"]
+
+                    # 满员（空闲为 0）时不存在可预约位置，进入排队流程
+                    if idle == 0:
+                        if auto_queue:
+                            if self.try_queue(row, rounds, q_threshold, q_condition) and not continuous:
+                                return True
+                        else:
+                            out("第 %d 轮：%s 已满员（%s/%s），未启用排队自动预约"
+                                % (rounds, row["name"], idle, total))
+                        continue
+
+                    if idle is not None and matched(idle, threshold, condition):
+                        out("第 %d 轮：%s 空闲 %s/%s，满足预约条件，开始预约"
+                            % (rounds, row["name"], idle, total))
+                        info = self.reserve(row["id"], row["name"])
+                        if info:
+                            self.report_reservation(info)
+                            if not continuous:
+                                return True
+                        continue
+
+                    out("第 %d 轮：%-22s 空闲 %s/%s，未达触发条件"
+                        % (rounds, row["name"], idle, total))
+            except NotLoggedIn:
+                out("登录状态已失效，正在重新登录", "WARN")
+                relogin(self.c, self.state)
+            except ApiError as e:
+                out("接口调用失败：%s" % e, "ERROR")
+            except NetworkError as e:
+                out("网络异常：%s" % e, "ERROR")
+            time.sleep(interval + random.uniform(0, 2))
+
+    def try_queue(self, row, rounds, threshold, condition):
+        """满员情况下的排队逻辑：人数满足条件 -> 排队 -> 跟踪排队结果。
+
+        返回 True 表示已排到位置并完成预约。"""
+        try:
+            messages = self.bus_messages(row["id"])
+        except (ApiError, NetworkError) as e:
+            out("第 %d 轮：%s 已满员，读取排队信息失败：%s" % (rounds, row["name"], e), "WARN")
+            return False
+        waiting = self.waiting_count(messages, row)
+        if waiting is None:
+            out("第 %d 轮：%s 已满员，未取得排队人数，等待下一轮" % (rounds, row["name"]), "WARN")
+            return False
+        if not matched(waiting, threshold, condition):
+            out("第 %d 轮：%s 已满员，当前排队 %s 人，未达排队触发条件"
+                % (rounds, row["name"], waiting))
+            return False
+
+        out("第 %d 轮：%s 已满员，当前排队 %s 人，满足排队条件，开始排队"
+            % (rounds, row["name"], waiting))
+        result = self.queue_up(row["id"])
+        ok, detail = self.judge_queue_result(result)
+        if not ok:
+            out("排队未成功：%s" % detail, "ERROR")
+            return False
+        out("排队成功：%s｜%s" % (row["name"], detail))
+        self.notify("排队成功｜%s｜%s" % (row["name"], detail))
+        return bool(self.watch_queue(row))
+
+    @staticmethod
+    def judge_queue_result(result):
+        if not isinstance(result, dict):
+            return True, "接口已受理"
+        flag = result.get("result")
+        if flag == "queued" or flag == 1 or flag is True or flag == "1":
+            n = pick_field(result, POSITION_KEYS)
+            wait = None
+            for k in ("expectedWaitingTime", "expected_waiting_time", "waitTime"):
+                if k in result:
+                    try:
+                        wait = int(float(result[k])) // 60
+                    except (TypeError, ValueError):
+                        pass
+                    break
+            detail = "排队状态已确认"
+            if n is not None:
+                detail += "，当前排位 %s 号" % n
+            if wait:
+                detail += "，预计等待 %s 分钟" % wait
+            return True, detail
+        msg = result.get("msg") or result.get("message") or ""
+        return False, ("系统返回：%s" % msg if msg else "系统未确认排队（返回 %s）"
+                       % json.dumps(result, ensure_ascii=False)[:120])
+
+    def watch_queue(self, row):
+        """排队跟踪：等待排到位置，排到后报告预约的浴室与位置编号。"""
+        limit_min = float(self.state.get("queue_max_wait_min") or 0)
+        deadline = time.time() + limit_min * 60 if limit_min > 0 else None
+        interval = max(3.0, float(self.state.get("poll_interval", 8)))
+        line("开始跟踪排队结果（每 %.0f 秒刷新一次）" % interval)
+        while True:
+            try:
+                messages = self.bus_messages(row["id"])
+                status = self.my_status(messages)
+                state_name = status.get("state")
+                if state_name in ("reserved", "running"):
+                    device = status.get("device") or {}
+                    info = {"area_id": row["id"],
+                            "area_name": device.get("deviceAreaName") or row["name"],
+                            "device": {"device_name": device.get("deviceNumber")
+                                       or device.get("device_number"),
+                                       "device_key": device.get("uuid") or device.get("deviceKey")},
+                            "result": {"deviceAreaName": device.get("deviceAreaName") or row["name"],
+                                       "deviceNumber": device.get("deviceNumber")
+                                       or device.get("device_number"),
+                                       "reserveTime": device.get("reserveTime")}}
+                    out("已排到位置，系统已完成预约")
+                    self.report_reservation(info, queued=True)
+                    return True
+                if state_name and state_name not in ("queuing",):
+                    out("排队状态已结束（当前状态：%s），返回空闲监控" % state_name, "WARN")
+                    return False
+                queue = status.get("queue") or {}
+                position = pick_field(queue, POSITION_KEYS)
+                if position is not None:
+                    out("排队中：当前排位 %s 号" % position)
+                else:
+                    waiting = self.waiting_count(messages, row)
+                    out("排队中：浴室当前排队 %s 人" % (waiting if waiting is not None else "未知"))
+            except NotLoggedIn:
+                out("登录状态已失效，正在重新登录", "WARN")
+                relogin(self.c, self.state)
+            except (ApiError, NetworkError) as e:
+                out("排队状态查询失败：%s" % e, "WARN")
+
+            if deadline and time.time() > deadline:
+                out("排队等待已超过设定时长，返回空闲监控（排队状态保持，可手工取消）", "WARN")
+                return False
+            time.sleep(interval)
+
+    # ---- 结果输出 ------------------------------------------------------
+
+    def report_reservation(self, info, queued=False):
+        result = info.get("result") or {}
+        device = info.get("device") or {}
+        area_name = result.get("deviceAreaName") or info.get("area_name") or "未知浴室"
+        number = result.get("deviceNumber") or device.get("device_number") or device.get("device_name")
+        confirmed = self.confirm_reservation(info)
+
+        print("-" * 62)
+        line("预约成功%s" % ("（排队自动排到）" if queued else ""))
+        line("浴室：%s" % area_name)
+        line("位置编号：%s" % (number if number is not None else "未提供"))
+        if result.get("reserveTime"):
+            line("预约时间：%s" % ts_text(result.get("reserveTime")))
+        if result.get("maxWaitTime"):
+            try:
+                line("有效时限：%s 分钟" % (int(float(result["maxWaitTime"])) // 60))
+            except (TypeError, ValueError):
+                pass
+        if confirmed:
+            line("状态复核：已确认（%s，位置 %s）"
+                 % (confirmed.get("area_name") or area_name,
+                    confirmed.get("device_number") or number))
+        else:
+            line("状态复核：接口已返回预约结果，未取得额外确认")
+        print("-" * 62)
+
+        msg = "预约成功｜浴室=%s｜位置编号=%s" % (area_name, number)
+        if result.get("reserveTime"):
+            msg += "｜预约时间=%s" % ts_text(result.get("reserveTime"))
+        self.notify(msg)
+        return msg
+
+    def notify(self, message):
+        cmd = (self.state.get("notify_cmd") or "").strip()
+        if not cmd:
+            return
+        try:
+            subprocess.run(cmd, shell=True, env=dict(os.environ, HY_DREAM_MSG=message), timeout=60)
+            out("通知命令已执行")
+        except Exception as e:
+            out("通知命令执行失败：%s" % e, "WARN")
+
+
+# ============================================================ 登录流程
+
+def is_rate_limited(e):
+    """站点登录限流：短时间多次失败后要求等待 10 分钟。"""
+    return isinstance(e, ApiError) and (str(e.code) in ("100", "1") or "重试" in (e.msg or ""))
+
+
+def wait_rate_limit(state, msg=""):
+    wait = int(state.get("rate_limit_wait", 600))
+    out("站点提示：%s" % (msg or "请求过于频繁"), "WARN")
+    out("程序将按站点要求等待 %d 分钟后再试（保持运行即可）" % max(1, wait // 60), "WARN")
+    try:
+        time.sleep(wait)
+    except KeyboardInterrupt:
+        raise NoInput()
+
+
+def ensure_login(client, state, interactive=True):
+    if client.restore_session(state.get("session")):
+        try:
+            client.api("UserApi", "getUserInfo")
+            out("已使用本地登录状态（无需重复输入密码）")
+            return True
+        except NotLoggedIn:
+            out("本地登录状态已过期，需要重新登录", "WARN")
+        except ApiError:
+            pass
+
+    for _ in range(3):
+        if interactive:
+            account = state.get("account") or ask("账号（手机号或昵称）")
+        else:
+            account = state.get("account")
+        password = state.get("password")
+        if not account:
+            return False
+        if not password or account != state.get("account"):
+            password = ask_secret("密码") if interactive else ""
+        if not password:
+            return False
+        try:
+            client.login(account, password)
+            state["account"], state["password"] = account, password
+            state["session"] = client.dump_session()
+            save_state(state)
+            out("登录成功")
+            return True
+        except ApiError as e:
+            if e.code == 102:
+                out("账号或密码不正确，请重新输入", "WARN")
+                state["password"] = ""
+                if not interactive:
+                    return False
+                continue
+            if is_rate_limited(e):
+                out("站点提示：%s" % e.msg, "WARN")
+                if not interactive:
+                    wait_rate_limit(state, e.msg)
+                    continue
+                state["password"] = ""
+                out("连续输入错误会被站点暂时限制，请确认账号与密码", "WARN")
+                continue
+            raise
+    out("登录未成功", "ERROR")
+    return False
+
+
+def safe_login(client, state, interactive=True):
+    """登录并兜住网络 / 接口异常，返回是否成功（避免启动阶段因网络问题退出）。"""
+    try:
+        return ensure_login(client, state, interactive=interactive)
+    except NetworkError as e:
+        out("无法连接服务器：%s" % e, "ERROR")
+        out("请检查网络连接后重试；如使用代理，请确认代理可用", "WARN")
+    except ApiError as e:
+        out("登录失败：%s" % e, "ERROR")
+    return False
+
+
+def relogin(client, state):
+    account, password = state.get("account"), state.get("password")
+    if not account or not password:
+        raise NotLoggedIn(100090, "缺少已保存的账号信息")
+    try:
+        client.login(account, password)
+    except ApiError as e:
+        if is_rate_limited(e):
+            wait_rate_limit(state, e.msg)
+            client.login(account, password)
+        else:
+            raise
+    state["session"] = client.dump_session()
+    save_state(state)
+    out("已重新登录")
+
+
+# ============================================================ 界面：主菜单
+
+def print_summary(state):
+    account = state.get("account") or "未设置"
+    if state.get("account"):
+        account = state["account"][:3] + "****" + state["account"][-4:] if len(state["account"]) > 7 \
+            else state["account"]
+    targets = "、".join(t["area_name"] for t in state.get("targets") or []) or "未设置"
+    print("   账号：%s" % account)
+    print("   目标浴室：%s" % targets)
+    print("   空闲触发：%s" % cond_text(state.get("condition", "le"),
+                                       state.get("threshold", 1), "空闲位置"))
+    if state.get("auto_queue"):
+        print("   排队触发：%s" % cond_text(state.get("queue_condition", "le"),
+                                            state.get("queue_threshold", 2), "排队人数"))
+    else:
+        print("   排队触发：未启用")
+    print("   检测周期：每 %s 秒" % state.get("poll_interval", 8))
+    if (state.get("notify_cmd") or "").strip():
+        print("   通知命令：已配置")
+
+
+
+def set_account(state, client):
+    clear()
+    banner()
+    title("账号与密码")
+    current = state.get("account") or ""
+    if current:
+        line("当前账号：%s" % current)
+    account = ask("账号（手机号或昵称）", default=current or None)
+    if not account:
+        line("未输入账号，已取消")
+        return state
+    password = ask_secret("密码")
+    if not password:
+        line("未输入密码，已取消")
+        return state
+    state["account"], state["password"] = account, password
+    state["session"] = {}
+    client.session_id = ""
+    client.jar = http.cookiejar.CookieJar()
+    save_state(state)
+    if safe_login(client, state, interactive=True):
+        Bot(client, state).whoami()
+    else:
+        out("账号信息已保存，但登录未通过，请在网络稳定后重试", "WARN")
+    pause()
+    return state
+
+
+def set_targets(state, client):
+    clear()
+    banner()
+    title("目标浴室与设备类型")
+    bot = Bot(client, state)
+    try:
+        bot.whoami()
+        bot.resolve_org_area()
+        bot.resolve_device_type(interactive=True)
+        areas = bot.areas()
+    except (ApiError, NetworkError) as e:
+        out("读取浴室列表失败：%s" % e, "ERROR")
+        pause()
+        return state
+    if not areas:
+        out("该校区未返回任何浴室", "ERROR")
+        pause()
+        return state
+
+    default_id = bot.user.get("default_device_area_id")
+    saved = [str(t["area_id"]) for t in state.get("targets") or []]
+
+    print()
+    print("   序号  浴室名称                    空闲/总计   说明")
+    print("   " + "-" * 58)
+    default_index = None
+    for i, a in enumerate(areas, 1):
+        marks = []
+        if str(a["id"]) in saved:
+            marks.append("上次所选")
+        if default_id and str(a["id"]) == str(default_id):
+            marks.append("账号默认")
+            default_index = i
+        print("   %-5s %-26s %-11s %s" % (i, a["name"],
+                                          "%s/%s" % (a["idle"], a["total"]),
+                                          "、".join(marks)))
+    print()
+    line("可多选，多个编号之间使用逗号分隔，例如 1,3")
+    if default_index:
+        line("直接回车 = 账号默认浴室（第 %d 项）" % default_index)
+    elif saved:
+        line("直接回车 = 沿用上次选择")
+    else:
+        line("直接回车 = 第 1 项")
+
+    while True:
+        raw = ask("请输入浴室序号")
+        if not raw:
+            if default_index:
+                chosen = [areas[default_index - 1]]
+            elif saved:
+                chosen = [a for a in areas if str(a["id"]) in saved] or [areas[0]]
+            else:
+                chosen = [areas[0]]
+            break
+        try:
+            idxs = [int(x.strip()) for x in raw.replace("，", ",").split(",") if x.strip()]
+            chosen = [areas[i - 1] for i in idxs if 1 <= i <= len(areas)]
+            if not chosen:
+                raise ValueError
+            break
+        except (ValueError, IndexError):
+            line("输入无效，请填写上方序号。")
+
+    state["targets"] = [{"area_id": a["id"], "area_name": a["name"]} for a in chosen]
+    save_state(state)
+    out("已选择目标浴室：%s" % "、".join(a["name"] for a in chosen))
+    pause()
+    return state
+
+
+def set_condition(state, client=None):
+    clear()
+    banner()
+    title("空闲预约条件")
+    line("当目标浴室的空闲位置数量满足下列条件时，程序将自动发起预约。")
+    print()
+    while True:
+        raw = ask("空闲位置数量阈值", default=state.get("threshold", 1))
+        try:
+            state["threshold"] = int(raw)
+            break
+        except ValueError:
+            line("请输入数字。")
+    print()
+    choice = ask_choice("请选择触发方式", [(1, "不超过阈值", "推荐，用于抓取剩余位置"),
+                                          (2, "恰好等于阈值", ""),
+                                          (3, "达到阈值及以上", "")], 1)
+    state["condition"] = {"1": "le", "2": "eq", "3": "ge"}[choice]
+    save_state(state)
+    out("空闲预约条件已更新：%s" % cond_text(state["condition"], state["threshold"], "空闲位置"))
+    pause()
+    return state
+
+
+def set_queue(state):
+    clear()
+    banner()
+    title("排队自动预约")
+    line("当目标浴室满员（空闲为 0）并进入排队模式时，")
+    line("程序会读取当前排队人数，人数满足条件时自动加入排队，并跟踪排队结果。")
+    print()
+    enabled = confirm("是否启用排队自动预约", default_yes=bool(state.get("auto_queue")))
+    state["auto_queue"] = enabled
+    if enabled:
+        print()
+        while True:
+            raw = ask("排队人数阈值（人）", default=state.get("queue_threshold", 2))
+            try:
+                state["queue_threshold"] = int(raw)
+                break
+            except ValueError:
+                line("请输入数字。")
+        print()
+        choice = ask_choice("请选择触发方式", [(1, "不超过阈值", "推荐，队列较短时立即排队"),
+                                              (2, "恰好等于阈值", ""),
+                                              (3, "达到阈值及以上", "")], 1)
+        state["queue_condition"] = {"1": "le", "2": "eq", "3": "ge"}[choice]
+        print()
+        while True:
+            raw = ask("排队最长等待时长（分钟，0 表示不限）", default=state.get("queue_max_wait_min", 0))
+            try:
+                state["queue_max_wait_min"] = int(raw)
+                break
+            except ValueError:
+                line("请输入数字。")
+    save_state(state)
+    if enabled:
+        out("排队自动预约已启用：%s" % cond_text(state["queue_condition"], state["queue_threshold"],
+                                               "排队人数"))
+    else:
+        out("排队自动预约已关闭")
+    pause()
+    return state
+
+
+def set_misc(state):
+    clear()
+    banner()
+    title("检测周期与结果通知")
+    while True:
+        raw = ask("检测周期（秒）", default=state.get("poll_interval", 8))
+        try:
+            state["poll_interval"] = max(3, int(float(raw)))
+            break
+        except ValueError:
+            line("请输入数字。")
+    line("周期过短可能触发站点安全策略，建议不低于 5 秒。")
+    print()
+    line("结果通知：预约成功后执行指定命令，消息内容存放在环境变量 HY_DREAM_MSG 中。")
+    raw = ask("通知命令（留空表示不启用）", default=state.get("notify_cmd") or None)
+    state["notify_cmd"] = "" if raw in (None, "", "无") else raw
+    save_state(state)
+    out("已保存：检测周期 %s 秒%s" % (state["poll_interval"],
+                                    "，已配置通知命令" if state["notify_cmd"] else "，未配置通知命令"))
+    pause()
+    return state
+
+
+def screen_open_with():
+    """修复 Windows 下 .py 文件的默认打开方式（仅影响当前用户）。"""
+    if os.name != "nt":
+        out("该设置仅适用于 Windows", "WARN")
+        pause()
+        return
+    clear()
+    banner()
+    title("启动方式修复")
+    try:
+        import winreg
+    except ImportError:
+        out("当前环境无法读取系统设置", "WARN")
+        pause()
+        return
+    try:
+        current = winreg.QueryValue(winreg.HKEY_CLASSES_ROOT, ".py")
+    except FileNotFoundError:
+        current = ""
+    if current == "Python.File":
+        line("当前双击 .py 文件即由 Python 直接运行，无需修复。")
+        pause()
+        return
+    line("当前双击 .py 文件时，系统使用的打开方式：%s" % (current or "未知程序"))
+    line("修复后双击本程序即可直接运行，不会打开其他软件。")
+    line("该修改仅作用于当前用户，可随时还原。")
+    print()
+    if not confirm("是否修复", default_yes=True):
+        return
+    try:
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"Software\Classes\.py", 0,
+                                 winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(key, "", 0, winreg.REG_SZ, "Python.File")
+        winreg.CloseKey(key)
+        now = winreg.QueryValue(winreg.HKEY_CLASSES_ROOT, ".py")
+        if now == "Python.File":
+            out("修复完成，双击本程序即可直接运行")
+            try:
+                line("调用方式：%s" % winreg.QueryValue(
+                    winreg.HKEY_CLASSES_ROOT, r"Python.File\shell\open\command"))
+            except FileNotFoundError:
+                pass
+        else:
+            out("修复未生效（当前仍为 %s）" % now, "WARN")
+    except OSError as e:
+        out("修复失败：%s" % e, "WARN")
+    line("如需还原：系统设置 → 应用 → 默认应用 → 按文件类型选择 → .py")
+    pause()
+
+
+# ============================================================ 界面：主流程
+
+def live_status(client, state, ttl=15, force=False):
+    """读取目标浴室的实时状态：空闲/总计，满员时显示当前排队人数。
+
+    结果缓存 ttl 秒，避免每次刷新菜单都请求接口。返回 [(名称, 状态文本, 标签)]。
+    """
+    targets = state.get("targets") or []
+    if not targets:
+        return []
+    if not client.session_id:
+        client.restore_session(state.get("session"))
+    if not client.session_id:
+        return [(t["area_name"], "未登录（启动监控时会自动登录）", "warn") for t in targets]
+
+    key = "|".join(str(t.get("area_id")) for t in targets)
+    now = time.time()
+    if not force and _STATUS_CACHE.get("key") == key and (now - _STATUS_CACHE.get("at", 0)) < ttl:
+        return _STATUS_CACHE.get("lines", [])
+
+    lines = []
+    try:
+        bot = Bot(client, state)
+        bot.org_area_id = state.get("org_area_id")
+        bot.device_type_key = state.get("device_type_key")
+        if not bot.org_area_id or not bot.device_type_key:
+            bot.bootstrap(verbose=False)
+        area_map = {str(a["id"]): a for a in bot.areas(retries=2)}
+        for t in targets:
+            row = area_map.get(str(t["area_id"]))
+            if row is None:
+                lines.append((t["area_name"], "已不在可预约列表中", "warn"))
+                continue
+            idle, total = row["idle"], row["total"]
+            if idle == 0:
+                waiting = None
+                try:
+                    waiting = bot.waiting_count(bot.bus_messages(row["id"], retries=2), row)
+                except (ApiError, NetworkError):
+                    pass
+                if waiting is None:
+                    lines.append((row["name"], "已满员（0/%s）" % total, "full"))
+                else:
+                    lines.append((row["name"], "已满员（0/%s）· 当前排队 %s 人" % (total, waiting), "full"))
+            else:
+                lines.append((row["name"], "空闲 %s/%s" % (idle, total), "ok"))
+    except NotLoggedIn:
+        lines = [(t["area_name"], "登录状态已失效（启动监控时重新登录）", "warn") for t in targets]
+    except (ApiError, NetworkError) as e:
+        lines = [(t["area_name"], "实时状态读取失败（%s）" % e, "warn") for t in targets]
+
+    _STATUS_CACHE["at"], _STATUS_CACHE["key"], _STATUS_CACHE["lines"] = now, key, lines
+    return lines
+
+
+def print_live_status(client, state):
+    """在主页面输出实时状态。"""
+    lines = live_status(client, state)
+    if not lines:
+        return
+    stamp = datetime.now().strftime("%H:%M:%S")
+    if len(lines) == 1:
+        print("   实时状态（%s）：%s" % (stamp, lines[0][1]))
+    else:
+        print("   实时状态（%s）：" % stamp)
+        for name, text, _ in lines:
+            print("      %-20s %s" % (name, text))
+
+
+def screen_main(state, client):
+    while True:
+        clear()
+        banner()
+        title("主菜单")
+        print_summary(state)
+        print_live_status(client, state)
+        print()
+        choice = ask_choice("请选择", [
+            (1, "启动自动预约监控", ""), (2, "修改运行设置", ""),
+            (3, "系统自检", ""), (4, "退出程序", ""),
+        ], 1)
+
+        if choice == "4":
+            return 0
+        if choice == "3":
+            clear()
+            banner()
+            title("系统自检")
+            self_test()
+            pause()
+            continue
+        if choice == "2":
+            while True:
+                clear()
+                banner()
+                title("修改运行设置")
+                print_summary(state)
+                print_live_status(client, state)
+                print()
+                sub = ask_choice("请选择设置项", [
+                    (1, "账号与密码", ""), (2, "目标浴室与设备类型", ""),
+                    (3, "空闲预约条件", ""), (4, "排队自动预约", ""),
+                    (5, "检测周期与结果通知", ""), (6, "启动方式修复", ""), (0, "返回", ""),
+                ], 0)
+                if sub == "0":
+                    break
+                if sub == "1":
+                    set_account(state, client)
+                elif sub == "2":
+                    if safe_login(client, state):
+                        state["session"] = client.dump_session()
+                        set_targets(state, client)
+                elif sub == "3":
+                    set_condition(state)
+                elif sub == "4":
+                    set_queue(state)
+                elif sub == "5":
+                    set_misc(state)
+                elif sub == "6":
+                    screen_open_with()
+            continue
+
+        # 启动监控
+        if not is_configured(state):
+            clear()
+            banner()
+            title("配置未完成")
+            line("启动监控前需要先完成以下配置：")
+            print()
+            if not state.get("account") or not state.get("password"):
+                print("   · 账号与密码")
+            if not state.get("targets"):
+                print("   · 目标浴室")
+            print()
+            line("请进入主菜单「修改运行设置」完成配置。")
+            pause()
+            continue
+        if not safe_login(client, state):
+            pause()
+            continue
+        state["session"] = client.dump_session()
+        save_state(state)
+        monitor_flow(state, client)
+        continue
+
+
+def fast_start(state, client):
+    """配置完备时的快速启动：倒计时后自动进入监控，可中断。"""
+    seconds = int(state.get("fast_start_seconds", 5))
+    clear()
+    banner()
+    title("快速启动")
+    print_summary(state)
+    print_live_status(client, state)
+    print()
+    if seconds > 0:
+        line("配置已就绪，%d 秒后自动启动监控" % seconds)
+        line("如不启动：按 S 进入设置，按 Q 退出程序")
+        print()
+        start = time.time()
+        while True:
+            remain = seconds - (time.time() - start)
+            if remain <= 0:
+                break
+            sys.stdout.write("\r   启动倒计时：%2d 秒 " % int(remain + 0.999))
+            sys.stdout.flush()
+            key = poll_key()
+            if key:
+                print()
+                key = key.lower()
+                if key == "s":
+                    return "settings"
+                if key in ("q", "0"):
+                    return "quit"
+                if key in ("\r", "\n", " "):
+                    break
+            time.sleep(0.15)
+        print()
+    if not safe_login(client, state):
+        return "settings"
+    state["session"] = client.dump_session()
+    save_state(state)
+    return "monitor"
+
+
+def poll_key():
+    """非阻塞读取一个按键（仅交互模式有效）。"""
+    if not can_interact():
+        return None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            if msvcrt.kbhit():
+                return msvcrt.getwch()
+            return None
+        import select
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+    except Exception:
+        return None
+    return None
+
+
+def monitor_flow(state, client):
+    bot = Bot(client, state)
+    try:
+        bot.monitor()
+        out("预约流程已结束")
+    except NotLoggedIn:
+        out("登录状态已失效，请重新登录后再启动", "WARN")
+    except KeyboardInterrupt:
+        raise
+    if can_interact():
+        pause("按回车返回主菜单")
+
+
+# ============================================================ 自检
+
+class SimClient:
+    """自检用的模拟客户端：不联网，按脚本返回接口数据。"""
+
+    def __init__(self, idle=0, queue_people=2):
+        self.idle = idle
+        self.queue_people = queue_people
+        self.bus = 0
+
+    def api(self, mod, act, data=None, retries=3):
+        if act == "getUserInfo":
+            return {"id": 1, "mobile": "13800000000", "user_nickname": "模拟账号",
+                    "available_balance": "0.00", "default_org_area_id": 105,
+                    "default_device_area_id": 12}
+        if act == "selectDeviceTypeByOrgAreaId":
+            return [{"device_type_key": "faucet", "device_type_name": "超级澡堂",
+                     "need_reserve": "1"}]
+        if act == "getSetting":
+            return {"checkBodyTemperature": "0", "enableDistributedEvent": "0"}
+        if act == "selectDeviceAreasWithDeviceState":
+            return [{"device_area_id": 12, "device_area_name": "4号楼1层（男）",
+                     "idleNum": self.idle, "totalNum": 8}]
+        if act == "selectDeviceAreas":
+            return [{"device_area_id": 12, "device_area_name": "4号楼1层（男）"}]
+        if act == "selectDevicesByAreaId":
+            return [{"device_key": "dev-31", "device_name": "31", "device_status": "ready"}]
+        if act == "exchangeMsg":
+            self.bus += 1
+            if self.bus == 1:
+                return [{"id": 1, "type": "waitingInfo",
+                         "content": {"queuingNumber": self.queue_people,
+                                     "expectedWaitingTime": 240}}]
+            return [{"id": 2, "type": "userState",
+                     "content": {"userState": "reserved",
+                                 "deviceInfo": {"uuid": "dev-77", "deviceNumber": "77",
+                                                "deviceAreaName": "4号楼1层（男）",
+                                                "reserveTime": 1789555000}}}]
+        if act == "queueUp":
+            return {"result": "queued", "queuingNumber": self.queue_people,
+                    "expectedWaitingTime": 240}
+        if act == "reserve":
+            return {"deviceNumber": "31", "deviceAreaName": "4号楼1层（男）",
+                    "reserveTime": 1789554900, "maxWaitTime": 1200}
+        if act == "createLog":
+            return []
+        raise ApiError(-9, "模拟环境未定义接口 %s/%s" % (mod, act))
+
+
+def simulate_flow(idle, queue_people):
+    """在没有网络的情况下走一遍完整监控流程，返回是否按预期结束。"""
+    global _LOG_DISABLED
+    import contextlib
+    import io
+    state = dict(DEFAULT_STATE)
+    state.update({"account": "selftest", "password": "selftest", "device_type_key": "faucet",
+                  "targets": [{"area_id": 12, "area_name": "4号楼1层（男）"}],
+                  "threshold": 1, "condition": "le", "auto_queue": True,
+                  "queue_threshold": queue_people, "queue_condition": "le",
+                  "poll_interval": 3})
+    previous = _LOG_DISABLED
+    _LOG_DISABLED = True
+    try:
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            done = Bot(SimClient(idle, queue_people), state).monitor()
+        text = buffer.getvalue()
+    except Exception as e:
+        _LOG_DISABLED = previous
+        out("模拟流程异常：%s" % e, "ERROR")
+        return False
+    _LOG_DISABLED = previous
+    if "预约成功" not in text:
+        return False
+    return done is True
+
+
+def self_test():
+    ok = True
+
+    plain = '{"header":{"auth":"00001"},"data":{"code":102,"msg":"密码不正确","data":[]}}'
+    checks = [
+        ("接口返回解析（明文）", HydreamClient._parse(plain)["data"]["code"] == 102),
+        ("接口返回解析（编码）", HydreamClient._parse(
+            base64.b64encode(plain.encode()).decode())["data"]["code"] == 102),
+    ]
+    try:
+        HydreamClient._parse("<html>Access Denied!</html>")
+        checks.append(("安全拦截识别", False))
+    except ApiError as e:
+        checks.append(("安全拦截识别", e.code == -2))
+
+    cond_ok = True
+    for value, th, cond, want in [(1, 1, "le", True), (0, 1, "le", True), (2, 1, "le", False),
+                                  (1, 1, "eq", True), (2, 1, "eq", False), (3, 1, "ge", True),
+                                  (0, 2, "ge", False)]:
+        if matched(value, th, cond) != want:
+            cond_ok = False
+    checks.append(("触发条件判断", cond_ok))
+
+    a1 = normalize_areas([{"device_area_id": 7, "device_area_name": "4号楼1层（男）",
+                           "idleNum": "3", "totalNum": "8"}])[0]
+    a2 = normalize_areas([{"deviceAreaId": 9, "freeNum": 0, "total_num": 6,
+                           "queuingNumber": 4}])[0]
+    checks.append(("浴室状态解析", a1["idle"] == 3 and a1["total"] == 8
+                   and a2["idle"] == 0 and a2["total"] == 6 and a2["waiting"] == 4))
+
+    msgs = [{"id": 1, "type": "waitingInfo", "content": {"queuingNumber": 3,
+                                                         "expectedWaitingTime": 240}},
+            {"id": 2, "type": "userState", "content": {"userState": "queuing",
+                                                       "queueInfo": {"queuingNumber": 3}}}]
+    bot_stub = Bot(HydreamClient(), dict(DEFAULT_STATE))
+    checks.append(("排队人数读取", bot_stub.waiting_count(msgs) == 3))
+    checks.append(("本人状态读取", bot_stub.my_status(msgs).get("state") == "queuing"))
+    checks.append(("排队结果判定",
+                   Bot.judge_queue_result({"result": "queued", "queuingNumber": 3})[0]
+                   and not Bot.judge_queue_result({"result": "fail", "msg": "已满员"})[0]))
+
+    c1 = HydreamClient()
+    c1.set_cookie("PHPSESSID", "sample123")
+    c1.session_name, c1.session_id = "PHPSESSID", "sample123"
+    c2 = HydreamClient()
+    checks.append(("登录状态保存与复用",
+                   c2.restore_session(c1.dump_session()) and c2.session_id == "sample123"))
+
+    checks.append(("流程模拟：空闲位置满足条件自动预约", simulate_flow(idle=1, queue_people=2)))
+    checks.append(("流程模拟：满员后按排队人数自动排队", simulate_flow(idle=0, queue_people=2)))
+
+    print()
+    for name, passed in checks:
+        print("   [%s] %s" % ("通过" if passed else "失败", name))
+        ok = ok and passed
+    print()
+    print("   自检结果：%s" % ("全部通过" if ok else "存在失败项，请联系维护人员"))
+    return ok
+
+
+# ============================================================ 入口
+
+def headless(client, state):
+    """无交互环境（计划任务、后台启动）：直接以已保存配置运行。"""
+    if not is_configured(state):
+        out("当前环境无键盘输入，且配置不完整，无法启动", "ERROR")
+        return 1
+    out("检测到无交互环境，使用已保存配置启动自动预约监控")
+    if not safe_login(client, state, interactive=False):
+        return 1
+    try:
+        Bot(client, state).monitor()
+    except NotLoggedIn:
+        out("登录状态已失效，无法继续", "ERROR")
+        return 1
+    return 0
+
+
+def main():
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+    state = load_state()
+    client = HydreamClient()
+
+    if not can_interact():
+        return headless(client, state)
+
+    if not is_configured(state):
+        # 首次使用：引导配置
+        clear()
+        banner()
+        title("首次使用")
+        print("   欢迎使用 %s。完成以下配置后即可自动预约：" % PROJECT)
+        print("   · 使用账号密码登录")
+        print("   · 选择要监控的浴室与触发条件")
+        print()
+        if not confirm("现在开始配置", default_yes=True):
+            return 0
+        if not safe_login(client, state):
+            pause("配置未完成，按回车退出")
+            return 1
+        state["session"] = client.dump_session()
+        save_state(state)
+        set_targets(state, client)
+        set_condition(state)
+        set_queue(state)
+        set_misc(state)
+        out("配置完成")
+        pause("按回车进入主菜单")
+
+    # 配置完备 -> 快速启动；否则进入主菜单
+    while True:
+        if is_configured(state):
+            action = fast_start(state, client)
+            if action == "quit":
+                return 0
+            if action == "monitor":
+                monitor_flow(state, client)
+                continue
+        screen_main(state, client)
+        return 0
+
+
+if __name__ == "__main__":
+    try:
+        code = main()
+    except NoInput:
+        code = headless(HydreamClient(), load_state())
+    except KeyboardInterrupt:
+        out("程序已终止", "WARN")
+        code = 130
+    except SystemExit:
+        raise
+    except Exception as e:
+        out("程序异常终止：%s: %s" % (type(e).__name__, e), "ERROR")
+        code = 1
+    if can_interact():
+        try:
+            input("\n  按回车关闭窗口…")
+        except Exception:
+            pass
+    sys.exit(code)
