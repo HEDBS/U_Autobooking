@@ -3,6 +3,10 @@
 """
 U_Autobooking · 浴室自动预约系统
 
+作者：HEDBS
+项目地址：https://github.com/HEDBS/U_Autobooking
+开源许可：MIT License（详见项目根目录 LICENSE 文件）
+
 功能概述
 --------
 本程序用于 h5.hydream.cn（浴室预约系统）的自动化操作，提供两类自动化：
@@ -42,6 +46,13 @@ from datetime import datetime
 
 VERSION = "1.0"
 PROJECT = "U_Autobooking"
+AUTHOR = "HEDBS"
+PROJECT_URL = "https://github.com/HEDBS/U_Autobooking"
+
+__author__ = AUTHOR
+__version__ = VERSION
+__url__ = PROJECT_URL
+__license__ = "MIT"
 
 # ============================================================ 路径 / 常量
 
@@ -131,6 +142,7 @@ def clear():
 def banner():
     print("=" * 62)
     print("  %s  浴室自动预约系统  v%s" % (PROJECT, VERSION))
+    print("  作者 %s   %s" % (AUTHOR, PROJECT_URL))
     print("=" * 62)
 
 

@@ -1,5 +1,7 @@
 # U_Autobooking · 浴室自动预约系统
 
+作者：**HEDBS** ｜ 项目地址：https://github.com/HEDBS/U_Autobooking ｜ 许可证：MIT
+
 针对 `h5.hydream.cn`（浴室预约系统）的自动预约工具。
 **单个 .py 文件，双击运行，全程菜单操作，无需命令行参数。**
 
