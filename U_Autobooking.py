@@ -257,6 +257,14 @@ class NotLoggedIn(ApiError):
     pass
 
 
+def status_conflict(e):
+    """站点提示「已有设备 / 已在排队」这类状态冲突，属于业务状态而非程序错误。"""
+    if not isinstance(e, ApiError):
+        return False
+    msg = e.msg or ""
+    return str(e.code) == "101212" or "同时只能使用" in msg or "已在排队" in msg or "正在排队" in msg
+
+
 class NetworkError(Exception):
     pass
 
@@ -447,6 +455,41 @@ def cond_text(condition, threshold, subject="空闲位置"):
     return tpl % (subject, threshold)
 
 
+def cond_issue(condition, threshold, subject="空闲位置"):
+    """检查条件设置是否退化（恒真或恒假），返回说明文字；无问题返回 None。"""
+    try:
+        threshold = int(threshold)
+    except (TypeError, ValueError):
+        return "阈值必须是整数"
+    if subject.startswith("空闲"):
+        if condition == "ge" and threshold < 1:
+            return "「%s ≥ %d」在任何情况下都成立，等同于无条件立即预约" % (subject, threshold)
+        if condition in ("le", "eq") and threshold < 1:
+            return "「%s ≤ %d」只在满员时成立，而满员会走排队流程，等于空闲预约失效" % (subject, threshold)
+    else:
+        if condition in ("ge", "eq") and threshold < 1:
+            return "「%s ≥ %d」在任何情况下都成立，等同于满员就排队" % (subject, threshold)
+    return None
+
+
+def cond_preview(condition, threshold, total=None):
+    """给用户看的效果预览：不同空闲/排队人数下会不会动作。"""
+    rows = []
+    if total:
+        samples = [total, max(1, total // 2), 2, 1, 0]
+    else:
+        samples = [28, 10, 3, 2, 1, 0]
+    seen = []
+    for n in samples:
+        if n in seen:
+            continue
+        seen.append(n)
+        rows.append("  %s %2d 个 -> %s" % ("空闲" if total else "空闲", n,
+                                          "预约" if matched(n, threshold, condition) else
+                                          ("排队" if n == 0 else "不动作")))
+    return rows
+
+
 def ts_text(value):
     try:
         return datetime.fromtimestamp(int(value)).strftime("%m-%d %H:%M:%S")
@@ -630,6 +673,48 @@ class Bot:
                         "raw": c}
         return {}
 
+    def busy_status(self, area_id):
+        """查询本人是否已有设备（已预约 / 使用中 / 排队中）。查询失败返回空。"""
+        try:
+            return self.my_status(self.bus_messages(area_id, retries=2))
+        except (ApiError, NetworkError):
+            return {}
+
+    @staticmethod
+    def describe_busy(status, fallback_name=""):
+        """把本人当前状态描述成一句话；没有占用时返回空字符串。"""
+        status = status or {}
+        name = status.get("state") or ""
+        device = status.get("device") or {}
+        queue = status.get("queue") or {}
+        area = (device.get("deviceAreaName") or device.get("device_area_name")
+                or fallback_name or "未知浴室")
+        number = device.get("deviceNumber") or device.get("device_name") or "?"
+        if name == "running":
+            return "使用中：%s 位置 %s" % (area, number)
+        if name == "reserved":
+            try:
+                remain = int(status.get("remain") or 0)
+            except (TypeError, ValueError):
+                remain = 0
+            text = "已预约：%s 位置 %s" % (area, number)
+            if remain > 0:
+                text += "，剩余约 %s" % ("%d 分钟" % (remain // 60) if remain >= 60 else "%d 秒" % remain)
+            return text
+        if name == "queuing":
+            position = pick_field(queue, POSITION_KEYS)
+            return "排队中：当前排位 %s 号" % (position if position is not None else "?")
+        return ""
+
+    def can_act(self, row, messages=None):
+        """动手前的检查：已有预约 / 使用中 / 排队中时不再重复操作（避免 101212）。"""
+        status = self.my_status(messages) if messages is not None else self.busy_status(row["id"])
+        text = self.describe_busy(status, row["name"])
+        if text:
+            out("本轮不执行操作 —— %s" % text, "WARN")
+            return False
+        return True
+
     def queue_up(self, area_id):
         self.health_log()
         return self.c.api("DeviceAreaApi", "queueUp",
@@ -710,6 +795,11 @@ class Bot:
         line("按 Ctrl+C 可随时终止")
         print("-" * 62)
 
+        for target in targets:                      # 先讲清账号当前被什么占着
+            text = self.describe_busy(self.busy_status(target["area_id"]), target["area_name"])
+            if text:
+                out("账号当前状态：%s；已有设备时不会重复预约" % text, "WARN")
+
         rounds = 0
         while True:
             rounds += 1
@@ -733,9 +823,17 @@ class Bot:
                         continue
 
                     if idle is not None and matched(idle, threshold, condition):
-                        out("第 %d 轮：%s 空闲 %s/%s，满足预约条件，开始预约"
+                        out("第 %d 轮：%s 空闲 %s/%s，满足预约条件，准备预约"
                             % (rounds, row["name"], idle, total))
-                        info = self.reserve(row["id"], row["name"])
+                        if not self.can_act(row):
+                            continue
+                        try:
+                            info = self.reserve(row["id"], row["name"])
+                        except ApiError as e:
+                            if status_conflict(e):
+                                out("服务器拒绝：%s。本轮跳过（你已有设备，等它结束后再抢）" % e.msg, "WARN")
+                                continue
+                            raise
                         if info:
                             self.report_reservation(info)
                             if not continuous:
@@ -762,6 +860,11 @@ class Bot:
         except (ApiError, NetworkError) as e:
             out("第 %d 轮：%s 已满员，读取排队信息失败：%s" % (rounds, row["name"], e), "WARN")
             return False
+        busy = self.describe_busy(self.my_status(messages), row["name"])
+        if busy:
+            out("第 %d 轮：%s（不重复排队）" % (rounds, busy))
+            return False
+
         waiting = self.waiting_count(messages, row)
         if waiting is None:
             out("第 %d 轮：%s 已满员，未取得排队人数，等待下一轮" % (rounds, row["name"]), "WARN")
@@ -773,7 +876,13 @@ class Bot:
 
         out("第 %d 轮：%s 已满员，当前排队 %s 人，满足排队条件，开始排队"
             % (rounds, row["name"], waiting))
-        result = self.queue_up(row["id"])
+        try:
+            result = self.queue_up(row["id"])
+        except ApiError as e:
+            if status_conflict(e):
+                out("服务器拒绝排队：%s" % e.msg, "WARN")
+                return False
+            raise
         ok, detail = self.judge_queue_result(result)
         if not ok:
             out("排队未成功：%s" % detail, "ERROR")
@@ -1006,9 +1115,16 @@ def print_summary(state):
     print("   目标浴室：%s" % targets)
     print("   空闲触发：%s" % cond_text(state.get("condition", "le"),
                                        state.get("threshold", 1), "空闲位置"))
+    issue = cond_issue(state.get("condition", "le"), state.get("threshold", 1), "空闲位置")
+    if issue:
+        print("             ！设置有问题：%s" % issue)
     if state.get("auto_queue"):
         print("   排队触发：%s" % cond_text(state.get("queue_condition", "le"),
                                             state.get("queue_threshold", 2), "排队人数"))
+        q_issue = cond_issue(state.get("queue_condition", "le"),
+                             state.get("queue_threshold", 2), "排队人数")
+        if q_issue:
+            print("             ！设置有问题：%s" % q_issue)
     else:
         print("   排队触发：未启用")
     print("   检测周期：每 %s 秒" % state.get("poll_interval", 8))
@@ -1120,22 +1236,46 @@ def set_condition(state, client=None):
     clear()
     banner()
     title("空闲预约条件")
-    line("当目标浴室的空闲位置数量满足下列条件时，程序将自动发起预约。")
+    line("只对「还有空位」的情况生效：按下面的规则决定什么时候自动预约。")
+    line("浴室满员（0 个空位）时不预约，改由「排队自动预约」接管。")
     print()
-    while True:
-        raw = ask("空闲位置数量阈值", default=state.get("threshold", 1))
-        try:
-            state["threshold"] = int(raw)
+    line("当前设置：%s" % cond_text(state.get("condition", "le"),
+                                   state.get("threshold", 1), "空闲位置"))
+    issue = cond_issue(state.get("condition", "le"), state.get("threshold", 1))
+    if issue:
+        line("当前设置有问题：%s" % issue)
+    print()
+    choice = ask_choice("请选择预约规则", [
+        (1, "有空位就预约", "空闲 ≥ 1，最积极"),
+        (2, "空闲剩 N 个及以下时预约", "抢最后几个位置，常用"),
+        (3, "空闲达到 N 个及以上时预约", "位置多、人少的时候去"),
+        (4, "空闲恰好为 N 个时预约", ""),
+        (0, "不修改，返回", ""),
+    ], 0)
+    if choice == "0":
+        return state
+    if choice == "1":
+        state["condition"], state["threshold"] = "ge", 1
+    else:
+        while True:
+            raw = ask("N（必须是 1 以上的整数）", default=max(1, state.get("threshold", 1)))
+            try:
+                n = int(raw)
+            except ValueError:
+                line("请输入数字。")
+                continue
+            if n < 1:
+                line("N 不能小于 1：填 0 会让规则恒真或恒假，达不到你要的效果。")
+                continue
+            state["threshold"] = n
             break
-        except ValueError:
-            line("请输入数字。")
-    print()
-    choice = ask_choice("请选择触发方式", [(1, "不超过阈值", "推荐，用于抓取剩余位置"),
-                                          (2, "恰好等于阈值", ""),
-                                          (3, "达到阈值及以上", "")], 1)
-    state["condition"] = {"1": "le", "2": "eq", "3": "ge"}[choice]
+        state["condition"] = {"2": "le", "3": "ge", "4": "eq"}[choice]
     save_state(state)
-    out("空闲预约条件已更新：%s" % cond_text(state["condition"], state["threshold"], "空闲位置"))
+    out("已保存：%s 时自动预约" % cond_text(state["condition"], state["threshold"], "空闲位置"))
+    print()
+    line("效果预览（按当前规则）：")
+    for row in cond_preview(state["condition"], state["threshold"]):
+        line(row)
     pause()
     return state
 
@@ -1151,18 +1291,32 @@ def set_queue(state):
     state["auto_queue"] = enabled
     if enabled:
         print()
+        line("当前设置：%s" % cond_text(state.get("queue_condition", "le"),
+                                       state.get("queue_threshold", 2), "排队人数"))
+        print()
+        choice = ask_choice("请选择排队规则", [
+            (1, "排队人数不超过 N 人时排队", "队列短、等得少"),
+            (2, "排队人数达到 N 人及以上时排队", "只有你指定的队列长度才排"),
+            (3, "排队人数恰好为 N 人时排队", ""),
+        ], 1)
         while True:
-            raw = ask("排队人数阈值（人）", default=state.get("queue_threshold", 2))
+            raw = ask("N（0 表示「已满员但无人排队」时也排，立即轮到你）",
+                      default=str(state.get("queue_threshold", 2)))
             try:
-                state["queue_threshold"] = int(raw)
-                break
+                n = int(raw)
             except ValueError:
                 line("请输入数字。")
-        print()
-        choice = ask_choice("请选择触发方式", [(1, "不超过阈值", "推荐，队列较短时立即排队"),
-                                              (2, "恰好等于阈值", ""),
-                                              (3, "达到阈值及以上", "")], 1)
-        state["queue_condition"] = {"1": "le", "2": "eq", "3": "ge"}[choice]
+                continue
+            cond = {"1": "le", "2": "ge", "3": "eq"}[choice]
+            if n < 0:
+                line("N 不能为负数。")
+                continue
+            issue = cond_issue(cond, n, "排队人数")
+            if issue:
+                line("这样设置有问题：%s" % issue)
+                continue
+            state["queue_threshold"], state["queue_condition"] = n, cond
+            break
         print()
         while True:
             raw = ask("排队最长等待时长（分钟，0 表示不限）", default=state.get("queue_max_wait_min", 0))
@@ -1288,12 +1442,16 @@ def live_status(client, state, ttl=15, force=False):
                 lines.append((t["area_name"], "已不在可预约列表中", "warn"))
                 continue
             idle, total = row["idle"], row["total"]
+            messages = []
+            try:
+                messages = bot.bus_messages(row["id"], retries=2)
+            except (ApiError, NetworkError):
+                messages = []
+            mine = bot.describe_busy(bot.my_status(messages), row["name"])
+            if mine:
+                lines.append((row["name"], "你 " + mine, "mine"))
             if idle == 0:
-                waiting = None
-                try:
-                    waiting = bot.waiting_count(bot.bus_messages(row["id"], retries=2), row)
-                except (ApiError, NetworkError):
-                    pass
+                waiting = bot.waiting_count(messages, row)
                 if waiting is None:
                     lines.append((row["name"], "已满员（0/%s）" % total, "full"))
                 else:
@@ -1315,12 +1473,15 @@ def print_live_status(client, state):
     if not lines:
         return
     stamp = datetime.now().strftime("%H:%M:%S")
-    if len(lines) == 1:
+    if len(lines) == 1 and lines[0][2] == "ok":
         print("   实时状态（%s）：%s" % (stamp, lines[0][1]))
     else:
         print("   实时状态（%s）：" % stamp)
-        for name, text, _ in lines:
-            print("      %-20s %s" % (name, text))
+        for name, text, tag in lines:
+            if tag == "mine":
+                print("      %s" % text)
+            else:
+                print("      %-20s %s" % (name, text))
 
 
 def screen_main(state, client):
@@ -1473,23 +1634,34 @@ def monitor_flow(state, client):
 # ============================================================ 自检
 
 class SimClient:
-    """自检用的模拟客户端：不联网，按脚本返回接口数据。"""
+    """自检用的模拟客户端：不联网，按脚本返回接口数据。
 
-    def __init__(self, idle=0, queue_people=2):
+    可模拟三种局面：有空位可预约、满员需排队、账号已有设备。
+    """
+
+    def __init__(self, idle=0, queue_people=2, already_reserved=False):
         self.idle = idle
         self.queue_people = queue_people
-        self.bus = 0
+        self.reserved = bool(already_reserved)
+        self.queued = False
+        self.q_polls = 0
+        self.reserve_calls = 0
+
+    @staticmethod
+    def _device_info():
+        return {"uuid": "dev-77", "deviceNumber": "77",
+                "deviceAreaName": "4号楼1层（男）", "reserveTime": 1789555000}
 
     def api(self, mod, act, data=None, retries=3):
         if act == "getUserInfo":
             return {"id": 1, "mobile": "13800000000", "user_nickname": "模拟账号",
                     "available_balance": "0.00", "default_org_area_id": 105,
                     "default_device_area_id": 12}
+        if act == "getSetting":
+            return {"checkBodyTemperature": "0", "enableDistributedEvent": "0"}
         if act == "selectDeviceTypeByOrgAreaId":
             return [{"device_type_key": "faucet", "device_type_name": "超级澡堂",
                      "need_reserve": "1"}]
-        if act == "getSetting":
-            return {"checkBodyTemperature": "0", "enableDistributedEvent": "0"}
         if act == "selectDeviceAreasWithDeviceState":
             return [{"device_area_id": 12, "device_area_name": "4号楼1层（男）",
                      "idleNum": self.idle, "totalNum": 8}]
@@ -1498,20 +1670,31 @@ class SimClient:
         if act == "selectDevicesByAreaId":
             return [{"device_key": "dev-31", "device_name": "31", "device_status": "ready"}]
         if act == "exchangeMsg":
-            self.bus += 1
-            if self.bus == 1:
-                return [{"id": 1, "type": "waitingInfo",
+            messages = [{"id": 1, "type": "waitingInfo",
                          "content": {"queuingNumber": self.queue_people,
                                      "expectedWaitingTime": 240}}]
-            return [{"id": 2, "type": "userState",
-                     "content": {"userState": "reserved",
-                                 "deviceInfo": {"uuid": "dev-77", "deviceNumber": "77",
-                                                "deviceAreaName": "4号楼1层（男）",
-                                                "reserveTime": 1789555000}}}]
+            if self.reserved:
+                name, device, queue = "reserved", self._device_info(), ""
+            elif self.queued:
+                self.q_polls += 1
+                if self.q_polls >= 2:          # 排队一轮后排到位置
+                    self.reserved = True
+                    name, device, queue = "reserved", self._device_info(), ""
+                else:
+                    name, device, queue = "queuing", "", {"queuingNumber": self.queue_people}
+            else:
+                name, device, queue = "normal", "", ""
+            messages.append({"id": 2, "type": "userState",
+                             "content": {"userState": name, "deviceInfo": device,
+                                         "queueInfo": queue, "remainTime": 120}})
+            return messages
         if act == "queueUp":
+            self.queued = True
             return {"result": "queued", "queuingNumber": self.queue_people,
                     "expectedWaitingTime": 240}
         if act == "reserve":
+            self.reserve_calls += 1
+            self.reserved = True
             return {"deviceNumber": "31", "deviceAreaName": "4号楼1层（男）",
                     "reserveTime": 1789554900, "maxWaitTime": 1200}
         if act == "createLog":
@@ -1519,32 +1702,56 @@ class SimClient:
         raise ApiError(-9, "模拟环境未定义接口 %s/%s" % (mod, act))
 
 
-def simulate_flow(idle, queue_people):
-    """在没有网络的情况下走一遍完整监控流程，返回是否按预期结束。"""
+def simulate_flow(idle, queue_people, already_reserved=False, expect="reserve",
+                  max_rounds=5):
+    """在没有网络的情况下走一遍完整监控流程。
+
+    expect="reserve" 期望成功预约；expect="skip" 期望因为已有设备而放弃预约。
+    """
     global _LOG_DISABLED
     import contextlib
     import io
+
+    class _Bot(Bot):
+        """加轮次上限，避免监控无限循环。"""
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.rounds = 0
+
+        def areas(self, retries=3):
+            self.rounds += 1
+            if self.rounds > max_rounds:
+                raise KeyboardInterrupt("轮次上限")
+            return super().areas(retries=retries)
+
     state = dict(DEFAULT_STATE)
     state.update({"account": "selftest", "password": "selftest", "device_type_key": "faucet",
                   "targets": [{"area_id": 12, "area_name": "4号楼1层（男）"}],
                   "threshold": 1, "condition": "le", "auto_queue": True,
                   "queue_threshold": queue_people, "queue_condition": "le",
                   "poll_interval": 3})
+    client = SimClient(idle=idle, queue_people=queue_people,
+                       already_reserved=already_reserved)
     previous = _LOG_DISABLED
     _LOG_DISABLED = True
     try:
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            done = Bot(SimClient(idle, queue_people), state).monitor()
+            try:
+                done = _Bot(client, state).monitor()
+            except KeyboardInterrupt:
+                done = "loop"
         text = buffer.getvalue()
     except Exception as e:
         _LOG_DISABLED = previous
         out("模拟流程异常：%s" % e, "ERROR")
         return False
     _LOG_DISABLED = previous
-    if "预约成功" not in text:
-        return False
-    return done is True
+
+    if expect == "skip":
+        return client.reserve_calls == 0 and "预约成功" not in text
+    return done is True and "预约成功" in text
 
 
 def self_test():
@@ -1597,6 +1804,16 @@ def self_test():
 
     checks.append(("流程模拟：空闲位置满足条件自动预约", simulate_flow(idle=1, queue_people=2)))
     checks.append(("流程模拟：满员后按排队人数自动排队", simulate_flow(idle=0, queue_people=2)))
+    checks.append(("流程模拟：已有预约时不重复预约",
+                   simulate_flow(idle=1, queue_people=2, already_reserved=True, expect="skip")))
+
+    checks.append(("条件退化识别（空闲 ≥ 0 属无条件）",
+                   cond_issue("ge", 0, "空闲位置") is not None
+                   and cond_issue("le", 0, "空闲位置") is not None
+                   and cond_issue("le", 1, "空闲位置") is None))
+    checks.append(("状态冲突识别（101212）",
+                   status_conflict(ApiError("101212", "你同时只能使用一台设备"))
+                   and not status_conflict(ApiError(102, "密码不正确"))))
 
     print()
     for name, passed in checks:
