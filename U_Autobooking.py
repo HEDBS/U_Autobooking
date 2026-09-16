@@ -73,6 +73,7 @@ DEFAULT_STATE = {
     "device_type_key": None,
     "device_type_name": "",
     "targets": [],              # [{"area_id": 12, "area_name": "4号楼1层（男）"}]
+    "auto_reserve": True,       # 是否启用空闲预约（不需要洗澡时关掉它，只排队占位）
     "threshold": 1,             # 空闲触发阈值
     "condition": "le",          # le / eq / ge
     "auto_queue": True,         # 是否启用排队自动预约
@@ -508,6 +509,7 @@ class Bot:
         self.device_type_key = None
         self.last_msg_id = 0
         self._area_meta_unsupported = False
+        self._queue_block_until = 0          # 排队被服务器拒绝后的冷却截止时间
         self.check_body_temperature = None   # 该校区是否需要体温登记（None = 未知）
 
     # ---- 基础信息 ------------------------------------------------------
@@ -782,14 +784,16 @@ class Bot:
         threshold = int(self.state.get("threshold", 1))
         condition = self.state.get("condition", "le")
         interval = max(3.0, float(self.state.get("poll_interval", 8)))
+        auto_reserve = bool(self.state.get("auto_reserve", True))
         auto_queue = bool(self.state.get("auto_queue"))
         q_threshold = int(self.state.get("queue_threshold", 2))
         q_condition = self.state.get("queue_condition", "le")
 
         title("自动预约监控已启动")
         line("目标浴室：%s" % "、".join(t["area_name"] for t in targets))
-        line("空闲触发：%s 自动预约" % cond_text(condition, threshold, "空闲位置"))
-        line("排队触发：%s" % (cond_text(q_condition, q_threshold, "排队人数") + " 自动排队"
+        line("空闲预约：%s" % (cond_text(condition, threshold, "空闲位置") + " 自动预约"
+                            if auto_reserve else "已关闭（只排队，不抢空位）"))
+        line("排队预约：%s" % (cond_text(q_condition, q_threshold, "排队人数") + " 自动排队"
                             if auto_queue else "未启用"))
         line("检测周期：每 %.0f 秒" % interval)
         line("按 Ctrl+C 可随时终止")
@@ -812,35 +816,33 @@ class Bot:
                         continue
                     idle, total = row["idle"], row["total"]
 
-                    # 满员（空闲为 0）时不存在可预约位置，进入排队流程
-                    if idle == 0:
-                        if auto_queue:
-                            if self.try_queue(row, rounds, q_threshold, q_condition) and not continuous:
-                                return True
-                        else:
-                            out("第 %d 轮：%s 已满员（%s/%s），未启用排队自动预约"
-                                % (rounds, row["name"], idle, total))
-                        continue
-
-                    if idle is not None and matched(idle, threshold, condition):
-                        out("第 %d 轮：%s 空闲 %s/%s，满足预约条件，准备预约"
+                    # 1) 有空位：按空闲条件预约（能直接拿到位置，优先于排队）
+                    if auto_reserve and idle not in (None, 0) and matched(idle, threshold, condition):
+                        out("第 %d 轮：%s 空闲 %s/%s，满足空闲条件，准备预约"
                             % (rounds, row["name"], idle, total))
-                        if not self.can_act(row):
-                            continue
-                        try:
-                            info = self.reserve(row["id"], row["name"])
-                        except ApiError as e:
-                            if status_conflict(e):
-                                out("服务器拒绝：%s。本轮跳过（你已有设备，等它结束后再抢）" % e.msg, "WARN")
-                                continue
-                            raise
-                        if info:
-                            self.report_reservation(info)
-                            if not continuous:
-                                return True
+                        if self.can_act(row):
+                            try:
+                                info = self.reserve(row["id"], row["name"])
+                            except ApiError as e:
+                                if status_conflict(e):
+                                    out("服务器拒绝：%s。本轮跳过（你已有设备，等它结束后再抢）" % e.msg,
+                                        "WARN")
+                                    continue
+                                raise
+                            if info:
+                                self.report_reservation(info)
+                                if not continuous:
+                                    return True
                         continue
 
-                    out("第 %d 轮：%-22s 空闲 %s/%s，未达触发条件"
+                    # 2) 排队：只看排队人数这一信号，不要求浴室满员
+                    if auto_queue:
+                        if self.try_queue(row, rounds, q_threshold, q_condition,
+                                          idle=idle, total=total) and not continuous:
+                            return True
+                        continue
+
+                    out("第 %d 轮：%-22s 空闲 %s/%s，未达触发条件（空闲预约已关闭）"
                         % (rounds, row["name"], idle, total))
             except NotLoggedIn:
                 out("登录状态已失效，正在重新登录", "WARN")
@@ -851,15 +853,21 @@ class Bot:
                 out("网络异常：%s" % e, "ERROR")
             time.sleep(interval + random.uniform(0, 2))
 
-    def try_queue(self, row, rounds, threshold, condition):
-        """满员情况下的排队逻辑：人数满足条件 -> 排队 -> 跟踪排队结果。
+    def try_queue(self, row, rounds, threshold, condition, idle=None, total=None):
+        """按排队人数决定是否加入排队。
 
-        返回 True 表示已排到位置并完成预约。"""
+        与旧逻辑的关键区别：不再要求浴室满员。排队人数本身就是触发信号
+        （队列越长代表排到得越晚，适合"现在不急着洗、先占个位"的用法）。
+        返回 True 表示已排到位置并完成预约。
+        """
+        if time.time() < self._queue_block_until:
+            return False                      # 上一轮被服务器拒绝，冷却期内不重试
         try:
             messages = self.bus_messages(row["id"])
         except (ApiError, NetworkError) as e:
-            out("第 %d 轮：%s 已满员，读取排队信息失败：%s" % (rounds, row["name"], e), "WARN")
+            out("第 %d 轮：读取排队信息失败：%s" % (rounds, e), "WARN")
             return False
+
         busy = self.describe_busy(self.my_status(messages), row["name"])
         if busy:
             out("第 %d 轮：%s（不重复排队）" % (rounds, busy))
@@ -867,22 +875,33 @@ class Bot:
 
         waiting = self.waiting_count(messages, row)
         if waiting is None:
-            out("第 %d 轮：%s 已满员，未取得排队人数，等待下一轮" % (rounds, row["name"]), "WARN")
-            return False
+            if idle == 0:
+                waiting = 0                   # 满员且总线未报排队 → 视为无人排队
+                out("第 %d 轮：%s 已满员，总线未返回排队人数，按 0 人处理"
+                    % (rounds, row["name"]))
+            else:
+                out("第 %d 轮：%s 空闲 %s/%s，总线未提供排队人数，本轮跳过"
+                    % (rounds, row["name"], idle, total))
+                return False
+
         if not matched(waiting, threshold, condition):
-            out("第 %d 轮：%s 已满员，当前排队 %s 人，未达排队触发条件"
-                % (rounds, row["name"], waiting))
+            out("第 %d 轮：%s 空闲 %s/%s，当前排队 %s 人 —— 未满足排队条件（%s）"
+                % (rounds, row["name"], idle, total, waiting,
+                   cond_text(condition, threshold, "排队人数")))
             return False
 
-        out("第 %d 轮：%s 已满员，当前排队 %s 人，满足排队条件，开始排队"
-            % (rounds, row["name"], waiting))
+        out("第 %d 轮：%s 空闲 %s/%s，当前排队 %s 人，满足排队条件，开始排队"
+            % (rounds, row["name"], idle, total, waiting))
         try:
             result = self.queue_up(row["id"])
         except ApiError as e:
             if status_conflict(e):
                 out("服务器拒绝排队：%s" % e.msg, "WARN")
                 return False
-            raise
+            self._queue_block_until = time.time() + 300
+            out("服务器拒绝排队：%s（%d 分钟内不再尝试排队）" % (e.msg, 5), "WARN")
+            return False
+
         ok, detail = self.judge_queue_result(result)
         if not ok:
             out("排队未成功：%s" % detail, "ERROR")
@@ -1113,13 +1132,16 @@ def print_summary(state):
     targets = "、".join(t["area_name"] for t in state.get("targets") or []) or "未设置"
     print("   账号：%s" % account)
     print("   目标浴室：%s" % targets)
-    print("   空闲触发：%s" % cond_text(state.get("condition", "le"),
-                                       state.get("threshold", 1), "空闲位置"))
-    issue = cond_issue(state.get("condition", "le"), state.get("threshold", 1), "空闲位置")
-    if issue:
-        print("             ！设置有问题：%s" % issue)
+    if state.get("auto_reserve", True):
+        print("   空闲预约：%s" % cond_text(state.get("condition", "le"),
+                                           state.get("threshold", 1), "空闲位置"))
+        issue = cond_issue(state.get("condition", "le"), state.get("threshold", 1), "空闲位置")
+        if issue:
+            print("             ！设置有问题：%s" % issue)
+    else:
+        print("   空闲预约：已关闭（只排队，不抢空位）")
     if state.get("auto_queue"):
-        print("   排队触发：%s" % cond_text(state.get("queue_condition", "le"),
+        print("   排队预约：%s" % cond_text(state.get("queue_condition", "le"),
                                             state.get("queue_threshold", 2), "排队人数"))
         q_issue = cond_issue(state.get("queue_condition", "le"),
                              state.get("queue_threshold", 2), "排队人数")
@@ -1245,6 +1267,14 @@ def set_condition(state, client=None):
     if issue:
         line("当前设置有问题：%s" % issue)
     print()
+    state["auto_reserve"] = confirm("是否启用空闲预约（不需要洗澡时选「否」，只保留排队占位）",
+                                    default_yes=bool(state.get("auto_reserve", True)))
+    save_state(state)
+    if not state["auto_reserve"]:
+        out("空闲预约已关闭：程序不会去抢空位，只按排队条件占位")
+        pause()
+        return state
+    print()
     choice = ask_choice("请选择预约规则", [
         (1, "有空位就预约", "空闲 ≥ 1，最积极"),
         (2, "空闲剩 N 个及以下时预约", "抢最后几个位置，常用"),
@@ -1284,8 +1314,9 @@ def set_queue(state):
     clear()
     banner()
     title("排队自动预约")
-    line("当目标浴室满员（空闲为 0）并进入排队模式时，")
-    line("程序会读取当前排队人数，人数满足条件时自动加入排队，并跟踪排队结果。")
+    line("当目标浴室的排队人数满足条件时，程序自动加入排队并跟踪排队结果。")
+    line("触发只取决于排队人数，与是否满员无关；队列越长说明排到得越晚，")
+    line("适合「现在不急着洗、先占个位」的用法。")
     print()
     enabled = confirm("是否启用排队自动预约", default_yes=bool(state.get("auto_queue")))
     state["auto_queue"] = enabled
@@ -1703,10 +1734,11 @@ class SimClient:
 
 
 def simulate_flow(idle, queue_people, already_reserved=False, expect="reserve",
-                  max_rounds=5):
+                  max_rounds=5, auto_reserve=True, reserve_rule=("le", 1)):
     """在没有网络的情况下走一遍完整监控流程。
 
-    expect="reserve" 期望成功预约；expect="skip" 期望因为已有设备而放弃预约。
+    expect="reserve" 期望抢到空位；expect="queue" 期望加入排队；
+    expect="skip" 期望因为已有设备而放弃所有动作。
     """
     global _LOG_DISABLED
     import contextlib
@@ -1728,7 +1760,9 @@ def simulate_flow(idle, queue_people, already_reserved=False, expect="reserve",
     state = dict(DEFAULT_STATE)
     state.update({"account": "selftest", "password": "selftest", "device_type_key": "faucet",
                   "targets": [{"area_id": 12, "area_name": "4号楼1层（男）"}],
-                  "threshold": 1, "condition": "le", "auto_queue": True,
+                  "auto_reserve": auto_reserve,
+                  "condition": reserve_rule[0], "threshold": reserve_rule[1],
+                  "auto_queue": True,
                   "queue_threshold": queue_people, "queue_condition": "le",
                   "poll_interval": 3})
     client = SimClient(idle=idle, queue_people=queue_people,
@@ -1751,6 +1785,8 @@ def simulate_flow(idle, queue_people, already_reserved=False, expect="reserve",
 
     if expect == "skip":
         return client.reserve_calls == 0 and "预约成功" not in text
+    if expect == "queue":
+        return client.queued and "排队成功" in text
     return done is True and "预约成功" in text
 
 
@@ -1802,9 +1838,13 @@ def self_test():
     checks.append(("登录状态保存与复用",
                    c2.restore_session(c1.dump_session()) and c2.session_id == "sample123"))
 
-    checks.append(("流程模拟：空闲位置满足条件自动预约", simulate_flow(idle=1, queue_people=2)))
-    checks.append(("流程模拟：满员后按排队人数自动排队", simulate_flow(idle=0, queue_people=2)))
-    checks.append(("流程模拟：已有预约时不重复预约",
+    checks.append(("流程模拟：空位达到条件时抢空位", simulate_flow(idle=1, queue_people=2)))
+    checks.append(("流程模拟：满员时按排队人数排队", simulate_flow(idle=0, queue_people=2)))
+    checks.append(("流程模拟：有空位但关闭空闲预约时改为排队（不要求满员）",
+                   simulate_flow(idle=1, queue_people=2, auto_reserve=False, expect="queue")))
+    checks.append(("流程模拟：空位很多也照样按排队人数占位",
+                   simulate_flow(idle=6, queue_people=2, auto_reserve=False, expect="queue")))
+    checks.append(("流程模拟：已有预约时不重复操作",
                    simulate_flow(idle=1, queue_people=2, already_reserved=True, expect="skip")))
 
     checks.append(("条件退化识别（空闲 ≥ 0 属无条件）",
