@@ -1570,6 +1570,124 @@ def set_targets(state, client):
     return state
 
 
+def set_bath_plan(state, client):
+    """定时预约设置：计划洗澡时间 / 性别 / 预计用时 / 到场准备 / 保守系数 / 放弃时限。"""
+    clear()
+    banner()
+    title("定时预约设置")
+    line("定时预约只有一个入口：设定你打算几点开始洗澡，其余由程序判断。")
+    line("· 到了该拿位置的时间：有空位直接抢位置，满员则加入排队")
+    line("· 还没到时间：只在预计等待能覆盖剩余时间时提前排队占位（宁可晚排，不早到）")
+    print()
+    if (state.get("target_time") or "").strip():
+        line("当前设置：%s 开始洗 ｜ 性别 %s ｜ 预计 %s 分钟 ｜ 到场准备 %s 分钟 ｜ 保守系数 %s ｜ 放弃时限 %s 分钟"
+             % (state["target_time"], GENDER_TEXT.get(state.get("gender", "auto"), "自动识别"),
+                state.get("avg_bath_minutes") or "按性别默认", state.get("arrive_lead_min", 5),
+                state.get("conservative_factor", 0.8), state.get("give_up_min", 30)))
+    else:
+        line("当前设置：尚未设置计划洗澡时间")
+    print()
+
+    default_time = state.get("target_time") or (datetime.now() + timedelta(hours=1)).strftime("%H:%M")
+    while True:
+        raw = ask("计划开始洗澡时间 HH:MM", default=default_time)
+        try:
+            hh, mm = [int(x) for x in raw.replace("：", ":").split(":")[:2]]
+            if not (0 <= hh <= 23 and 0 <= mm <= 59):
+                raise ValueError
+            state["target_time"] = "%02d:%02d" % (hh, mm)
+            break
+        except ValueError:
+            line("格式不对，请按 HH:MM 填写，例如 21:30。")
+
+    print()
+    default_choice = {"auto": 1, "male": 2, "female": 3}.get(state.get("gender", "auto"), 1)
+    choice = ask_choice("性别（用于取平均洗澡时长与校验浴室限制）", [
+        (1, "自动识别（从账号读取）", "推荐"),
+        (2, "男", ""),
+        (3, "女", ""),
+    ], default_choice)
+    state["gender"] = {"1": "auto", "2": "male", "3": "female"}[choice]
+
+    gender = state["gender"]
+    if gender == "auto":
+        try:
+            gender = Bot(client, state).resolve_gender()
+            line("账号读取到的性别：%s" % GENDER_TEXT.get(gender, gender))
+        except Exception:
+            gender = "unknown"
+        if gender == "unknown":
+            line("账号里没有性别信息（保密），将按通用值估算")
+
+    default_min = AVG_BATH_MINUTES.get(gender, 15)
+    while True:
+        raw = ask("每次洗澡预计用时（分钟）", default=str(state.get("avg_bath_minutes") or default_min))
+        try:
+            minutes = int(raw)
+            if not (1 <= minutes <= 240):
+                line("请填 1~240 之间的分钟数。")
+                continue
+            state["avg_bath_minutes"] = minutes
+            break
+        except ValueError:
+            line("请输入数字。")
+
+    while True:
+        raw = ask("到场准备时间（分钟：拿到位置后到进浴室开门的时间）",
+                  default=str(state.get("arrive_lead_min", 5)))
+        try:
+            state["arrive_lead_min"] = max(0, min(120, int(raw)))
+            break
+        except ValueError:
+            line("请输入数字。")
+
+    while True:
+        raw = ask("保守系数（0.1~1.0，越小越保守＝越晚排队，避免提前把你叫走）",
+                  default=str(state.get("conservative_factor", 0.8)))
+        try:
+            factor = float(raw)
+            if not (0.1 <= factor <= 1.0):
+                line("请填 0.1~1.0 之间。")
+                continue
+            state["conservative_factor"] = factor
+            break
+        except ValueError:
+            line("请输入数字。")
+
+    while True:
+        raw = ask("超过计划时间多少分钟还没拿到位置就停止",
+                  default=str(state.get("give_up_min", 30)))
+        try:
+            state["give_up_min"] = max(1, int(raw))
+            break
+        except ValueError:
+            line("请输入数字。")
+
+    save_state(state)
+    print()
+    try:
+        bot = Bot(client, state)
+        plan = bot.plan()
+        ready = plan["target"] - timedelta(minutes=plan["lead"])
+        out("已保存：%s 开始洗（%s 分钟），最早 %s 拿位置"
+            % (plan["target"].strftime("%H:%M"), plan["avg_min"], ready.strftime("%H:%M")))
+        try:                                  # 立即跑一次合法性检查
+            types = bot.device_types()
+            areas = bot.areas()
+            row = next((a for a in areas if str(a["id"]) == str(
+                (state.get("targets") or [{}])[0].get("area_id"))), None)
+            ok, notes = bot.validate_plan(plan, row, types)
+            line("合法性检查：%s" % ("通过" if ok else "不通过"))
+            for note in notes:
+                line("  " + note)
+        except (ApiError, NetworkError) as e:
+            line("合法性检查未能完成（%s），启动监控时会再检查一次" % e)
+    except ApiError as e:
+        out("时间设置有问题：%s" % e, "WARN")
+    pause()
+    return state
+
+
 def set_misc(state):
     clear()
     banner()
@@ -2006,6 +2124,13 @@ class SimClient:
             return []
         raise ApiError(-9, "模拟环境未定义接口 %s/%s" % (mod, act))
 
+    # 供界面冒烟测试使用（模拟登录态存取）
+    def restore_session(self, session):
+        return True
+
+    def dump_session(self):
+        return {"name": "PHPSESSID", "id": "sim", "cookies": []}
+
 
 def simulate_flow(idle, plan_min_away=3, lead=5, wait_sec=240, already_reserved=False,
                   expect="reserve", max_rounds=6):
@@ -2068,6 +2193,61 @@ def simulate_flow(idle, plan_min_away=3, lead=5, wait_sec=240, already_reserved=
         return (client.reserve_calls == 0 and client.queue_calls == 0
                 and "预约成功" not in text and "排队成功" not in text)
     return False
+
+
+def menu_smoke_test():
+    """离线冒烟：把各设置界面依次跑一遍。
+
+    菜单层不参与流程模拟，也不联网，却最容易出"函数缺失/签名不符"这类问题，
+    所以单独跑一遍，任何异常都算失败。
+    """
+    import contextlib
+    import io
+
+    answers = []
+    stubs = {
+        "ask": lambda prompt, default=None: (answers.pop(0) if answers else (default if default is not None else "")),
+        "ask_choice": lambda prompt, options, default=1: str(default),
+        "ask_secret": lambda prompt: "placeholder",
+        "confirm": lambda prompt, default_yes=False: True,
+        "pause": lambda text="": None,
+        "clear": lambda: None,
+        "banner": lambda: None,
+        "title": lambda text: None,
+        "line": lambda text="": None,
+        "out": lambda *a, **k: None,
+    }
+    saved = {k: globals().get(k) for k in stubs}
+    errors = []
+    try:
+        globals().update(stubs)
+        client = SimClient(idle=2)
+        base = dict(DEFAULT_STATE)
+        base.update({"account": "selftest", "password": "selftest",
+                     "device_type_key": "faucet",
+                     "targets": [{"area_id": 12, "area_name": "4号楼1层（男）"}],
+                     "target_time": "21:30"})
+        cases = [
+            ("定时预约设置", lambda: set_bath_plan(dict(base), client)),
+            ("检测周期与通知", lambda: set_misc(dict(base))),
+            ("目标浴室选择", lambda: set_targets(dict(base), client)),
+            ("取消排队/预约", lambda: screen_cancel(dict(base), client)),
+            ("启动方式修复检查", lambda: screen_open_with()),
+        ]
+        for name, fn in cases:
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    fn()
+            except Exception as e:
+                errors.append("%s → %s: %s" % (name, type(e).__name__, e))
+    finally:
+        for key, value in saved.items():
+            if value is not None:
+                globals()[key] = value
+    if errors:
+        for item in errors:
+            out("菜单冒烟失败：" + item, "ERROR")
+    return not errors
 
 
 def self_test():
@@ -2174,6 +2354,49 @@ def self_test():
     checks.append(("状态冲突识别（101212）",
                    status_conflict(ApiError("101212", "你同时只能使用一台设备"))
                    and not status_conflict(ApiError(102, "密码不正确"))))
+
+    # 静态审计：被调用的函数必须都已定义（防"整个函数被误删"这类自检盲区）
+    try:
+        import ast as _ast
+        tree = _ast.parse(open(__file__, encoding="utf-8").read())
+        icons = {n.name for n in _ast.walk(tree)
+                 if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef))}
+        icons |= {t.id for n in _ast.walk(tree) if isinstance(n, _ast.Assign)
+                  for t in n.targets if isinstance(t, _ast.Name)}
+        for n in _ast.walk(tree):
+            if isinstance(n, _ast.Import):
+                icons |= {(a.asname or a.name.split(".")[0]) for a in n.names}
+            if isinstance(n, _ast.ImportFrom):
+                icons |= {(a.asname or a.name) for a in n.names}
+        import builtins as _builtins
+        icons |= set(dir(_builtins))
+        # 局部名（函数参数、赋值目标、循环变量、with as、except as、推导式变量）也要算进来
+        for node in _ast.walk(tree):
+            if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                for arg in (node.args.args + node.args.kwonlyargs + node.args.posonlyargs):
+                    icons.add(arg.arg)
+                if node.args.vararg:
+                    icons.add(node.args.vararg.arg)
+                if node.args.kwarg:
+                    icons.add(node.args.kwarg.arg)
+            if isinstance(node, _ast.Name) and isinstance(node.ctx, _ast.Store):
+                icons.add(node.id)
+            if isinstance(node, _ast.ExceptHandler) and node.name:
+                icons.add(node.name)
+            if isinstance(node, _ast.comprehension) and isinstance(node.target, _ast.Name):
+                icons.add(node.target.id)
+            if isinstance(node, _ast.withitem) and isinstance(node.optional_vars, _ast.Name):
+                icons.add(node.optional_vars.id)
+        unknown = sorted({n.func.id for n in _ast.walk(tree) if isinstance(n, _ast.Call)
+                          and isinstance(n.func, _ast.Name) and n.func.id not in icons})
+        checks.append(("静态审计：所有被调用的函数均已定义", not unknown))
+        if unknown:
+            out("未定义的函数：%s" % "、".join(unknown), "ERROR")
+    except Exception as e:
+        checks.append(("静态审计：所有被调用的函数均已定义", False))
+        out("静态审计失败：%s" % e, "ERROR")
+
+    checks.append(("界面冒烟：各设置界面可正常执行（不联网）", menu_smoke_test()))
 
     print()
     for name, passed in checks:
