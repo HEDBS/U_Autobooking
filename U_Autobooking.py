@@ -141,6 +141,8 @@ DEFAULT_STATE = {
     "arrive_lead_min": 5,       # 到场准备时间（分钟）：拿到位置后多久能到浴室
     "conservative_factor": 0.8, # 保守系数：低估排队等待，宁可晚排也不早到
     "give_up_min": 30,          # 超过计划时间这么多分钟还没拿到位置就停止
+    "auto_cancel_early": True,  # 排到的时间早于计划时间时，自动取消这次位置并重新等
+    "cancel_queue_on_giveup": True,  # 超过计划时间仍未拿到位置时，自动退出排队
     "fast_start_seconds": 5,    # 配置完备时的快速启动倒计时（秒），0 = 直接启动
     "auto_health_log": True,    # 自动提交体温登记（部分校区预约前置条件）
     "temperature": "36.01",
@@ -570,6 +572,8 @@ class Bot:
         self.last_msg_id = 0
         self._area_meta_unsupported = False
         self._queue_block_until = 0          # 排队被服务器拒绝后的冷却截止时间
+        self.plan_current = None             # 本次监控使用的时间计划
+        self._early_cancel_count = 0         # 因"排到太早"自动取消的次数
         self.check_body_temperature = None   # 该校区是否需要体温登记（None = 未知）
 
     # ---- 基础信息 ------------------------------------------------------
@@ -783,14 +787,39 @@ class Bot:
                           {"deviceAreaId": area_id,
                            "deviceTypeKey": self.device_type_key}) or {}
 
-    def cancel_queue(self, area_id):
-        try:
-            return self.c.api("DeviceAreaApi", "cancelQueue",
-                              {"deviceAreaId": area_id,
-                               "deviceTypeKey": self.device_type_key}) or {}
-        except ApiError as e:
-            out("取消排队未成功：%s" % e, "WARN")
-            return {}
+    def cancel_current(self, area_id=None):
+        """取消本人当前的排队或预约。返回 (是否成功, 说明)。"""
+        area_id = area_id or ((self.state.get("targets") or [{}])[0].get("area_id"))
+        status = {}
+        if area_id:
+            try:
+                status = self.my_status(self.bus_messages(area_id, retries=1))
+            except (ApiError, NetworkError):
+                status = {}
+        kind = status.get("state")
+        device = status.get("device") or {}
+
+        if kind == "queuing":
+            try:
+                self.c.api("DeviceAreaApi", "cancelQueue",
+                           {"deviceAreaId": area_id, "deviceTypeKey": self.device_type_key})
+                return True, "已取消排队"
+            except ApiError as e:
+                return False, "取消排队失败：%s" % e.msg
+        if kind in ("reserved", "running"):
+            if not device.get("uuid"):
+                return False, "读不到当前设备信息，无法自动取消，请在手机端操作"
+            try:
+                self.c.api("DeviceApi", "cancelReserve",
+                           {"uuid": device.get("uuid"),
+                            "deviceType": device.get("device_type_key") or self.device_type_key})
+                return True, "已取消%s（%s 位置 %s）" % (
+                    "使用中的设备" if kind == "running" else "预约",
+                    device.get("deviceAreaName") or device.get("device_area_name") or "",
+                    device.get("deviceNumber") or "?")
+            except ApiError as e:
+                return False, "取消预约失败：%s" % e.msg
+        return False, "当前没有排队或预约（账号状态：%s）" % (kind or "未知")
 
     # ---- 结果确认 ------------------------------------------------------
 
@@ -1021,6 +1050,7 @@ class Bot:
         interval = max(1.0, min(60.0, interval))
 
         plan = self.plan()
+        self.plan_current = plan
         if plan:                                   # 预约时间合法性检查
             try:
                 types = self.device_types()
@@ -1088,6 +1118,11 @@ class Bot:
                         if now_ts > plan["target"].timestamp() + plan["give_up"] * 60:
                             out("已超过计划时间 %d 分钟仍未拿到位置，停止监控" % plan["give_up"],
                                 "WARN")
+                            if self.state.get("cancel_queue_on_giveup", True):
+                                st = self.busy_status(target["area_id"])
+                                if (st or {}).get("state") == "queuing":
+                                    ok, msg = self.cancel_current(target["area_id"])
+                                    out("自动退出排队：%s" % msg, "WARN" if not ok else "INFO")
                             return False
                         allow_reserve, allow_queue, why = plan_gate(
                             now_ts, plan["target"].timestamp(), plan["lead"],
@@ -1222,14 +1257,15 @@ class Bot:
                        % json.dumps(result, ensure_ascii=False)[:120])
 
     def watch_queue(self, row):
-        """排队跟踪：等待排到位置，排到后报告预约的浴室与位置编号。"""
+        """排队跟踪：等待排到位置；若排到时间早于计划，可按设置自动取消重来。"""
         limit_min = float(self.state.get("queue_max_wait_min") or 0)
         deadline = time.time() + limit_min * 60 if limit_min > 0 else None
-        interval = max(3.0, float(self.state.get("poll_interval", 8)))
-        line("开始跟踪排队结果（每 %.0f 秒刷新一次）" % interval)
+        interval = max(1.0, min(60.0, float(self.state.get("poll_interval", 1) or 1)))
+        line("开始跟踪排队结果（每 %.0f 秒刷新一次，Ctrl+C 可停止本程序）" % interval)
+        line("排队状态如需取消，可在主菜单选「取消排队 / 取消预约」")
         while True:
             try:
-                messages = self.bus_messages(row["id"])
+                messages = self.bus_messages(row["id"], retries=1)
                 status = self.my_status(messages)
                 state_name = status.get("state")
                 if state_name in ("reserved", "running"):
@@ -1243,18 +1279,35 @@ class Bot:
                                        "deviceNumber": device.get("deviceNumber")
                                        or device.get("device_number"),
                                        "reserveTime": device.get("reserveTime")}}
+                    plan = self.plan_current
+                    if plan and self.state.get("auto_cancel_early", True):
+                        ready_at = plan["target"].timestamp() - plan["lead"] * 60
+                        if time.time() < ready_at - 30:
+                            if self._early_cancel_count >= 3:
+                                out("已连续 %d 次排到太早，停止自动取消（避免反复消耗预约次数），"
+                                    "本次位置保留" % self._early_cancel_count, "WARN")
+                                self.report_reservation(info, queued=True)
+                                return True
+                            ok, msg = self.cancel_current(row["id"])
+                            self._early_cancel_count += 1
+                            self._queue_block_until = time.time() + 300
+                            out("排到的时间早于计划（%s 才需要到场），%s"
+                                % ((plan["target"] - timedelta(minutes=plan["lead"])).strftime("%H:%M"),
+                                   msg), "WARN")
+                            out("已置为「不重复排队」5 分钟，之后再按条件重新排队")
+                            return False
                     out("已排到位置，系统已完成预约")
                     self.report_reservation(info, queued=True)
                     return True
                 if state_name and state_name not in ("queuing",):
-                    out("排队状态已结束（当前状态：%s），返回空闲监控" % state_name, "WARN")
+                    out("排队已结束（当前状态：%s），返回空闲监控" % state_name, "WARN")
                     return False
                 queue = status.get("queue") or {}
                 position = pick_field(queue, POSITION_KEYS)
                 if position is not None:
                     out("排队中：当前排位 %s 号" % position)
                 else:
-                    waiting = self.waiting_count(messages, row)
+                    waiting = self.waiting_count(messages)
                     out("排队中：浴室当前排队 %s 人" % (waiting if waiting is not None else "未知"))
             except NotLoggedIn:
                 out("登录状态已失效，正在重新登录", "WARN")
@@ -1932,6 +1985,58 @@ def print_live_status(client, state):
                 print("      %s" % text)
             else:
                 print("      %-20s %s" % (name, text))
+
+
+def screen_cancel(state, client):
+    """取消当前的排队或预约。"""
+    clear()
+    banner()
+    title("取消排队 / 取消预约")
+    if not is_configured(state):
+        line("尚未完成配置，无法查询账号状态。")
+        pause()
+        return
+    if not safe_login(client, state):
+        pause()
+        return
+    state["session"] = client.dump_session()
+    save_state(state)
+    bot = Bot(client, state)
+    try:
+        bot.bootstrap(verbose=False)
+        found = None
+        for target in state.get("targets") or []:
+            status = bot.busy_status(target["area_id"])
+            text = bot.describe_busy(status, target["area_name"])
+            if text:
+                found = (target, text)
+                break
+        if not found:
+            line("当前账号没有排队或预约，无需取消。")
+            pause()
+            return
+        target, text = found
+        line("当前状态：%s" % text)
+        print()
+        line("取消后：排队中会退出队列；已预约会立即释放该位置，")
+        line("（即使不取消，预约后未在规定时间内到场，站点也会自动释放。）")
+        print()
+        if not confirm("确认取消", default_yes=False):
+            line("已放弃取消，状态保持不变。")
+            pause()
+            return
+        ok, msg = bot.cancel_current(target["area_id"])
+        out(msg, "INFO" if ok else "ERROR")
+        if ok:
+            try:
+                status = bot.busy_status(target["area_id"])
+                line("复核结果：%s" % (bot.describe_busy(status, target["area_name"]) or "已无占用"))
+            except (ApiError, NetworkError):
+                pass
+    except (ApiError, NetworkError) as e:
+        out("查询账号状态失败：%s" % e, "ERROR")
+    pause()
+    return
 
 
 def screen_main(state, client):
