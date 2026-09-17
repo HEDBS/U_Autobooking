@@ -326,7 +326,7 @@ class NetworkError(Exception):
 
 
 class HydreamClient:
-    def __init__(self, timeout=20, debug=False):
+    def __init__(self, timeout=10, debug=False):
         self.timeout = timeout
         self.debug = debug
         self.session_name = ""
@@ -391,12 +391,12 @@ class HydreamClient:
             except NetworkError as e:
                 last = e
                 out("网络请求失败（第 %d/%d 次）：%s" % (attempt, retries, e), "WARN")
-                time.sleep(2 * attempt)
+                time.sleep(1.0 * attempt)
             except ApiError as e:
                 if e.code == -2 and attempt < retries:
                     last = e
                     out("请求被安全策略拦截（第 %d/%d 次），正在重试" % (attempt, retries), "WARN")
-                    time.sleep(2 * attempt)
+                    time.sleep(1.0 * attempt)
                     continue
                 raise
         if parsed is None:
@@ -579,9 +579,9 @@ class Bot:
             self.user.get("available_balance") or "0.00"))
         return self.user
 
-    def device_types(self):
+    def device_types(self, retries=3):
         return self.c.api("DeviceAreaApi", "selectDeviceTypeByOrgAreaId",
-                          {"orgAreaId": self.org_area_id}) or []
+                          {"orgAreaId": self.org_area_id}, retries=retries) or []
 
     def areas(self, retries=3):
         rows = self.c.api("DeviceAreaApi", "selectDeviceAreasWithDeviceState",
@@ -1049,11 +1049,13 @@ class Bot:
             return False
         self.plan_current = plan
 
+        out("正在连接站点做启动前检查…")
         try:
-            types = self.device_types()
-            areas = self.areas()
+            types = self.device_types(retries=2)
+            areas = self.areas(retries=2)
         except (ApiError, NetworkError) as e:
             out("读取浴室信息失败：%s" % e, "ERROR")
+            out("站点当前响应异常，稍后重试即可", "WARN")
             return False
         row = next((a for a in areas if str(a["id"]) == str(targets[0]["area_id"])), None)
         ok, notes = self.validate_plan(plan, row, types)
@@ -1381,7 +1383,7 @@ def ensure_login(client, state, interactive=True):
         except ApiError:
             pass
 
-    for _ in range(3):
+    for attempt in range(3):
         if interactive:
             account = state.get("account") or ask("账号（手机号或昵称）")
         else:
@@ -1394,6 +1396,8 @@ def ensure_login(client, state, interactive=True):
         if not password:
             return False
         try:
+            if interactive:
+                out("正在登录（站点响应慢时最多等约 %d 秒）…" % (client.timeout * 2))
             client.login(account, password)
             state["account"], state["password"] = account, password
             state["session"] = client.dump_session()
@@ -1505,12 +1509,14 @@ def set_targets(state, client):
     title("目标浴室与设备类型")
     bot = Bot(client, state)
     try:
+        line("正在读取浴室列表（站点响应慢时会等几秒）…")
         bot.whoami()
         bot.resolve_org_area()
         bot.resolve_device_type(interactive=True)
-        areas = bot.areas()
+        areas = bot.areas(retries=1)
     except (ApiError, NetworkError) as e:
         out("读取浴室列表失败：%s" % e, "ERROR")
+        out("请稍后重试；若频繁失败请在设置菜单里调大检测周期。", "WARN")
         pause()
         return state
     if not areas:
@@ -1671,9 +1677,10 @@ def set_bath_plan(state, client):
         ready = plan["target"] - timedelta(minutes=plan["lead"])
         out("已保存：%s 开始洗（%s 分钟），最早 %s 拿位置"
             % (plan["target"].strftime("%H:%M"), plan["avg_min"], ready.strftime("%H:%M")))
+        line("正在连接站点做合法性检查（最长约 10 秒）…")
         try:                                  # 立即跑一次合法性检查
-            types = bot.device_types()
-            areas = bot.areas()
+            types = bot.device_types(retries=1)
+            areas = bot.areas(retries=1)
             row = next((a for a in areas if str(a["id"]) == str(
                 (state.get("targets") or [{}])[0].get("area_id"))), None)
             ok, notes = bot.validate_plan(plan, row, types)
@@ -1794,7 +1801,7 @@ def live_status(client, state, ttl=15, force=False):
         bot.device_type_key = state.get("device_type_key")
         if not bot.org_area_id or not bot.device_type_key:
             bot.bootstrap(verbose=False)
-        area_map = {str(a["id"]): a for a in bot.areas(retries=2)}
+        area_map = {str(a["id"]): a for a in bot.areas(retries=1)}
         for t in targets:
             row = area_map.get(str(t["area_id"]))
             if row is None:
@@ -1859,6 +1866,7 @@ def screen_cancel(state, client):
     save_state(state)
     bot = Bot(client, state)
     try:
+        line("正在查询账号当前状态（最长约 10 秒）…")
         bot.bootstrap(verbose=False)
         found = None
         for target in state.get("targets") or []:
@@ -2216,6 +2224,7 @@ def menu_smoke_test():
         "title": lambda text: None,
         "line": lambda text="": None,
         "out": lambda *a, **k: None,
+        "save_state": lambda *a, **k: True,     # 冒烟测试绝不能写真实配置文件
     }
     saved = {k: globals().get(k) for k in stubs}
     errors = []
