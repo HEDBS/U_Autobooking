@@ -126,24 +126,16 @@ DEFAULT_STATE = {
     "org_area_id": None,
     "device_type_key": None,
     "device_type_name": "",
-    "targets": [],              # [{"area_id": 12, "area_name": "4号楼1层（男）"}]
-    "auto_reserve": True,       # 是否启用空闲预约（不需要洗澡时关掉它，只排队占位）
-    "threshold": 1,             # 空闲触发阈值
-    "condition": "le",          # le / eq / ge
-    "auto_queue": True,         # 是否启用排队自动预约
-    "queue_threshold": 2,       # 排队人数阈值
-    "queue_condition": "le",    # le / eq / ge
-    "queue_max_wait_min": 0,    # 排队最长等待（分钟），0 = 不限
-    "poll_interval": 1,         # 检测周期（秒），1~60，默认 1 秒
+    "targets": [],              # [{"area_id": 12, "area_name": "10#1层 (男)"}]
+    "target_time": "",          # 计划开始洗澡时间 "21:30"（定时预约的唯一入口，必填）
     "gender": "auto",           # auto=从账号读取；也可手动指定 male/female
     "avg_bath_minutes": None,   # None=按性别用内置平均时长；也可自填（分钟）
-    "target_time": "",          # 计划开始洗澡时间 "21:30"，留空=不启用时间计划
     "arrive_lead_min": 5,       # 到场准备时间（分钟）：拿到位置后多久能到浴室
     "conservative_factor": 0.8, # 保守系数：低估排队等待，宁可晚排也不早到
     "give_up_min": 30,          # 超过计划时间这么多分钟还没拿到位置就停止
     "auto_cancel_early": True,  # 排到的时间早于计划时间时，自动取消这次位置并重新等
     "cancel_queue_on_giveup": True,  # 超过计划时间仍未拿到位置时，自动退出排队
-    "fast_start_seconds": 5,    # 配置完备时的快速启动倒计时（秒），0 = 直接启动
+    "poll_interval": 1,         # 检测周期（秒），1~60
     "auto_health_log": True,    # 自动提交体温登记（部分校区预约前置条件）
     "temperature": "36.01",
     "notify_cmd": "",           # 结果通知命令，消息内容见环境变量 HY_DREAM_MSG
@@ -304,7 +296,8 @@ def save_state(state, path=STATE_PATH):
 
 
 def is_configured(state):
-    return bool(state.get("account") and state.get("password") and state.get("targets"))
+    return bool(state.get("account") and state.get("password") and state.get("targets")
+                and (state.get("target_time") or "").strip())
 
 
 # ============================================================ 接口客户端
@@ -1031,18 +1024,18 @@ class Bot:
         return True
 
     def monitor(self, continuous=False):
+        """定时预约监控：一切以「计划洗澡时间」为准。
+
+        · 已到该拿位置的时间 → 有空位直接抢，满员就排队
+        · 还没到该拿位置的时间 → 只在「站点预计等待能覆盖剩余时间」时提前排队占位
+        · 全程保守：宁可晚排，不早到
+        """
         targets = self.state.get("targets") or []
         if not targets:
             out("尚未配置目标浴室，请先进入「修改运行设置」完成配置", "ERROR")
             return False
         self.bootstrap()
 
-        threshold = int(self.state.get("threshold", 1))
-        condition = self.state.get("condition", "le")
-        auto_reserve = bool(self.state.get("auto_reserve", True))
-        auto_queue = bool(self.state.get("auto_queue"))
-        q_threshold = int(self.state.get("queue_threshold", 2))
-        q_condition = self.state.get("queue_condition", "le")
         try:
             interval = float(self.state.get("poll_interval", 1) or 1)
         except (TypeError, ValueError):
@@ -1050,40 +1043,38 @@ class Bot:
         interval = max(1.0, min(60.0, interval))
 
         plan = self.plan()
+        if not plan:
+            out("尚未设置「计划洗澡时间」，定时预约无法启动", "ERROR")
+            out("请进入 修改运行设置 → 定时预约设置，设定开始洗澡的时间", "WARN")
+            return False
         self.plan_current = plan
-        if plan:                                   # 预约时间合法性检查
-            try:
-                types = self.device_types()
-                areas = self.areas()
-            except (ApiError, NetworkError) as e:
-                out("读取浴室信息失败：%s" % e, "ERROR")
-                return False
-            row = next((a for a in areas if str(a["id"]) == str(targets[0]["area_id"])), None)
-            ok, notes = self.validate_plan(plan, row, types)
-            title("预约时间合法性检查")
-            line("计划洗澡时间：%s（%s）" % (plan["target"].strftime("%m-%d %H:%M"),
-                                            "明天" if plan["rolled"] else "今天"))
-            line("性别 %s ｜ 预计用时 %d 分钟 ｜ 到场准备 %d 分钟 ｜ 保守系数 %s"
-                 % (GENDER_TEXT.get(plan["gender"], plan["gender"]), plan["avg_min"],
-                    plan["lead"], plan["factor"]))
-            for note in (notes or ["未发现问题"]):
-                line(note)
-            if not ok:
-                out("预约时间不合法，已停止启动", "ERROR")
-                return False
 
-        title("自动预约监控已启动")
+        try:
+            types = self.device_types()
+            areas = self.areas()
+        except (ApiError, NetworkError) as e:
+            out("读取浴室信息失败：%s" % e, "ERROR")
+            return False
+        row = next((a for a in areas if str(a["id"]) == str(targets[0]["area_id"])), None)
+        ok, notes = self.validate_plan(plan, row, types)
+
+        title("定时预约 · 时间合法性检查")
+        line("计划洗澡时间：%s（%s）" % (plan["target"].strftime("%m-%d %H:%M"),
+                                        "明天" if plan["rolled"] else "今天"))
+        line("性别 %s ｜ 预计用时 %d 分钟 ｜ 到场准备 %d 分钟 ｜ 保守系数 %s"
+             % (GENDER_TEXT.get(plan["gender"], plan["gender"]), plan["avg_min"],
+                plan["lead"], plan["factor"]))
+        line("最早拿位置时间：%s（抢到后 %d 分钟内需到场，否则站点自动取消）"
+             % ((plan["target"] - timedelta(minutes=plan["lead"])).strftime("%H:%M"), plan["lead"]))
+        for note in (notes or ["未发现问题"]):
+            line(note)
+        if not ok:
+            out("预约时间不合法，已停止启动", "ERROR")
+            return False
+
+        title("定时预约监控已启动")
         line("目标浴室：%s" % "、".join(t["area_name"] for t in targets))
-        if plan:
-            line("时间计划：%s 开始洗（%s 分钟）｜ 不早于 %s 拿位置"
-                 % (plan["target"].strftime("%H:%M"), plan["avg_min"],
-                    (plan["target"] - timedelta(minutes=plan["lead"])).strftime("%H:%M")))
-        line("空闲预约：%s" % (cond_text(condition, threshold, "空闲位置") + " 自动预约"
-                            if auto_reserve else "已关闭（只排队，不抢空位）"))
-        line("排队预约：%s" % (cond_text(q_condition, q_threshold, "排队人数") + " 自动排队"
-                            if auto_queue else "未启用"))
-        line("检测周期：每 %.0f 秒" % interval)
-        line("按 Ctrl+C 可随时终止")
+        line("检测周期：每 %.0f 秒   （按 Ctrl+C 可随时终止）" % interval)
         print("-" * 62)
 
         for target in targets:
@@ -1107,63 +1098,65 @@ class Bot:
                         out("第 %d 轮：%s 未取得空位数据，本轮跳过" % (rounds, name), "WARN")
                         continue
 
+                    now_ts = time.time()
+                    ready_at = plan["target"].timestamp() - plan["lead"] * 60
                     wait_sec = data["wait_sec"]
                     if wait_sec is None and data["waiting"]:
-                        per = plan["avg_min"] * 60 if plan else 600
-                        wait_sec = data["waiting"] * per
-                    allow_reserve = allow_queue = True
-                    why = ""
-                    if plan:
-                        now_ts = time.time()
-                        if now_ts > plan["target"].timestamp() + plan["give_up"] * 60:
-                            out("已超过计划时间 %d 分钟仍未拿到位置，停止监控" % plan["give_up"],
-                                "WARN")
-                            if self.state.get("cancel_queue_on_giveup", True):
-                                st = self.busy_status(target["area_id"])
-                                if (st or {}).get("state") == "queuing":
-                                    ok, msg = self.cancel_current(target["area_id"])
-                                    out("自动退出排队：%s" % msg, "WARN" if not ok else "INFO")
-                            return False
-                        allow_reserve, allow_queue, why = plan_gate(
-                            now_ts, plan["target"].timestamp(), plan["lead"],
-                            wait_sec=wait_sec, factor=plan["factor"])
+                        wait_sec = data["waiting"] * plan["avg_min"] * 60
+                    est_wait = int(wait_sec * plan["factor"]) if wait_sec else None
 
-                    # 1) 抢空位（优先：能直接拿到位置）
-                    if auto_reserve and idle > 0 and matched(idle, threshold, condition):
-                        if not allow_reserve:
-                            out("第 %d 轮：%s 空闲 %s/%s 满足空闲条件，但%s"
-                                % (rounds, name, idle, total, why))
-                            continue
-                        out("第 %d 轮：%s 空闲 %s/%s，满足空闲条件，准备预约"
-                            % (rounds, name, idle, total))
-                        try:
-                            info = self.reserve(target["area_id"], name)
-                        except ApiError as e:
-                            if status_conflict(e):
-                                out("服务器拒绝：%s。本轮跳过（你已有设备）" % e.msg, "WARN")
-                                continue
-                            raise
-                        if info:
-                            self.report_reservation(info)
-                            if not continuous:
+                    if now_ts > plan["target"].timestamp() + plan["give_up"] * 60:
+                        out("已超过计划时间 %d 分钟仍未拿到位置，停止监控" % plan["give_up"], "WARN")
+                        if self.state.get("cancel_queue_on_giveup", True) \
+                                and (data["mine"] or {}).get("state") == "queuing":
+                            ok2, msg = self.cancel_current(target["area_id"])
+                            out("自动退出排队：%s" % msg, "WARN" if not ok2 else "INFO")
+                        return False
+
+                    if now_ts >= ready_at:
+                        # —— 已到该拿位置的时间 ——
+                        if idle > 0:
+                            out("第 %d 轮：%s 已到时间（%s 开始洗），空闲 %s/%s，直接抢位置"
+                                % (rounds, name, plan["target"].strftime("%H:%M"), idle, total))
+                            try:
+                                info = self.reserve(target["area_id"], name)
+                            except ApiError as e:
+                                if status_conflict(e):
+                                    out("服务器拒绝：%s。本轮跳过（你已有设备）" % e.msg, "WARN")
+                                    continue
+                                raise
+                            if info:
+                                self.report_reservation(info)
+                                if not continuous:
+                                    return True
+                        else:
+                            out("第 %d 轮：%s 已到时间且已满员，加入排队"
+                                % (rounds, name))
+                            if self.try_queue(target, rounds, messages=data["messages"],
+                                              idle=idle, total=total, wait_sec=wait_sec,
+                                              reason="已到计划时间") and not continuous:
                                 return True
                         continue
 
-                    # 2) 排队
-                    if auto_queue:
-                        if not allow_queue:
-                            out("第 %d 轮：%s 空闲 %s/%s，排队 %s 人 —— %s"
-                                % (rounds, name, idle, total, data["waiting"], why))
-                            continue
-                        if self.try_queue(target, rounds, q_threshold, q_condition,
-                                          idle=idle, total=total,
-                                          messages=data["messages"],
-                                          wait_sec=wait_sec) and not continuous:
-                            return True
+                    # —— 还没到时间：只有预计等待足够长才提前排队占位 ——
+                    remaining = int(ready_at - now_ts)
+                    if est_wait is None:
+                        out("第 %d 轮：%s 空闲 %s/%s，距该拿位置还有 %s，排队时长未知，继续等"
+                            % (rounds, name, idle, total, human_secs(remaining)))
                         continue
-
-                    out("第 %d 轮：%-22s 空闲 %s/%s，无动作（空闲预约已关闭）"
-                        % (rounds, name, idle, total))
+                    if est_wait < remaining:
+                        out("第 %d 轮：%s 空闲 %s/%s，当前排队 %s 人、预计等待 %s，"
+                            "不足以覆盖剩余 %s，继续等"
+                            % (rounds, name, idle, total,
+                               data["waiting"] if data["waiting"] is not None else "?",
+                               human_secs(est_wait), human_secs(remaining)))
+                        continue
+                    out("第 %d 轮：%s 预计等待 %s（已按保守系数 %s 折算）可覆盖剩余 %s，提前排队占位"
+                        % (rounds, name, human_secs(est_wait), plan["factor"], human_secs(remaining)))
+                    if self.try_queue(target, rounds, messages=data["messages"],
+                                      idle=idle, total=total, wait_sec=wait_sec,
+                                      reason="提前占位") and not continuous:
+                        return True
             except NotLoggedIn:
                 out("登录状态已失效，正在重新登录", "WARN")
                 relogin(self.c, self.state)
@@ -1173,9 +1166,9 @@ class Bot:
                 out("网络异常：%s" % e, "ERROR")
             time.sleep(interval + random.uniform(0, 0.2))
 
-    def try_queue(self, target, rounds, threshold, condition, idle=None, total=None,
-                  messages=None, wait_sec=None):
-        """按排队人数决定是否加入排队（不要求浴室满员）。
+    def try_queue(self, target, rounds, messages=None, idle=None, total=None,
+                  wait_sec=None, reason=""):
+        """加入排队（不要求浴室满员）。是否该排由调用方按定时预约规则判断。
 
         返回 True 表示已排到位置并完成预约。
         """
@@ -1204,15 +1197,10 @@ class Bot:
                     % (rounds, row["name"], idle, total))
                 return False
 
-        if not matched(waiting, threshold, condition):
-            out("第 %d 轮：%s 空闲 %s/%s，排队 %s 人 —— 未满足排队条件（%s）"
-                % (rounds, row["name"], idle, total, waiting,
-                   cond_text(condition, threshold, "排队人数")))
-            return False
-
-        out("第 %d 轮：%s 空闲 %s/%s，排队 %s 人%s，满足排队条件，开始排队"
+        out("第 %d 轮：%s 空闲 %s/%s，当前排队 %s 人%s%s，加入排队"
             % (rounds, row["name"], idle, total, waiting,
-               "（站点预计等待 %s）" % human_secs(wait_sec) if wait_sec else ""))
+               "（站点预计等待 %s）" % human_secs(wait_sec) if wait_sec else "",
+               "，%s" % reason if reason else ""))
         try:
             result = self.queue_up(row["id"])
         except ApiError as e:
@@ -1466,37 +1454,21 @@ def relogin(client, state):
 def print_summary(state):
     account = state.get("account") or "未设置"
     if state.get("account"):
-        account = state["account"][:3] + "****" + state["account"][-4:] if len(state["account"]) > 7 \
-            else state["account"]
+        account = account[:3] + "****" + account[-4:] if len(account) > 7 else account
     targets = "、".join(t["area_name"] for t in state.get("targets") or []) or "未设置"
     print("   账号：%s" % account)
     print("   目标浴室：%s" % targets)
-    if state.get("auto_reserve", True):
-        print("   空闲预约：%s" % cond_text(state.get("condition", "le"),
-                                           state.get("threshold", 1), "空闲位置"))
-        issue = cond_issue(state.get("condition", "le"), state.get("threshold", 1), "空闲位置")
-        if issue:
-            print("             ！设置有问题：%s" % issue)
-    else:
-        print("   空闲预约：已关闭（只排队，不抢空位）")
-    if state.get("auto_queue"):
-        print("   排队预约：%s" % cond_text(state.get("queue_condition", "le"),
-                                            state.get("queue_threshold", 2), "排队人数"))
-        q_issue = cond_issue(state.get("queue_condition", "le"),
-                             state.get("queue_threshold", 2), "排队人数")
-        if q_issue:
-            print("             ！设置有问题：%s" % q_issue)
-    else:
-        print("   排队触发：未启用")
-    if (state.get("target_time") or "").strip():
-        print("   时间计划：%s 开始洗 ｜ 性别 %s ｜ 预计 %s 分钟 ｜ 到场准备 %s 分钟 ｜ 保守系数 %s"
-              % (state["target_time"], GENDER_TEXT.get(state.get("gender", "auto"), "自动识别"),
+    plan_raw = (state.get("target_time") or "").strip()
+    if plan_raw:
+        print("   定时预约：%s 开始洗 ｜ 性别 %s ｜ 预计 %s 分钟 ｜ 到场准备 %s 分钟 ｜ 保守系数 %s"
+              % (plan_raw, GENDER_TEXT.get(state.get("gender", "auto"), "自动识别"),
                  state.get("avg_bath_minutes") or "按性别默认",
                  state.get("arrive_lead_min", 5), state.get("conservative_factor", 0.8)))
+    else:
+        print("   定时预约：未设置（启动前必须设置）")
     print("   检测周期：每 %s 秒" % state.get("poll_interval", 1))
     if (state.get("notify_cmd") or "").strip():
         print("   通知命令：已配置")
-
 
 
 def set_account(state, client):
@@ -1594,240 +1566,6 @@ def set_targets(state, client):
     state["targets"] = [{"area_id": a["id"], "area_name": a["name"]} for a in chosen]
     save_state(state)
     out("已选择目标浴室：%s" % "、".join(a["name"] for a in chosen))
-    pause()
-    return state
-
-
-def set_condition(state, client=None):
-    clear()
-    banner()
-    title("空闲预约条件")
-    line("只对「还有空位」的情况生效：按下面的规则决定什么时候自动预约。")
-    line("浴室满员（0 个空位）时不预约，改由「排队自动预约」接管。")
-    print()
-    line("当前设置：%s" % cond_text(state.get("condition", "le"),
-                                   state.get("threshold", 1), "空闲位置"))
-    issue = cond_issue(state.get("condition", "le"), state.get("threshold", 1))
-    if issue:
-        line("当前设置有问题：%s" % issue)
-    print()
-    state["auto_reserve"] = confirm("是否启用空闲预约（不需要洗澡时选「否」，只保留排队占位）",
-                                    default_yes=bool(state.get("auto_reserve", True)))
-    save_state(state)
-    if not state["auto_reserve"]:
-        out("空闲预约已关闭：程序不会去抢空位，只按排队条件占位")
-        pause()
-        return state
-    print()
-    choice = ask_choice("请选择预约规则", [
-        (1, "有空位就预约", "空闲 ≥ 1，最积极"),
-        (2, "空闲剩 N 个及以下时预约", "抢最后几个位置，常用"),
-        (3, "空闲达到 N 个及以上时预约", "位置多、人少的时候去"),
-        (4, "空闲恰好为 N 个时预约", ""),
-        (0, "不修改，返回", ""),
-    ], 0)
-    if choice == "0":
-        return state
-    if choice == "1":
-        state["condition"], state["threshold"] = "ge", 1
-    else:
-        while True:
-            raw = ask("N（必须是 1 以上的整数）", default=max(1, state.get("threshold", 1)))
-            try:
-                n = int(raw)
-            except ValueError:
-                line("请输入数字。")
-                continue
-            if n < 1:
-                line("N 不能小于 1：填 0 会让规则恒真或恒假，达不到你要的效果。")
-                continue
-            state["threshold"] = n
-            break
-        state["condition"] = {"2": "le", "3": "ge", "4": "eq"}[choice]
-    save_state(state)
-    out("已保存：%s 时自动预约" % cond_text(state["condition"], state["threshold"], "空闲位置"))
-    print()
-    line("效果预览（按当前规则）：")
-    for row in cond_preview(state["condition"], state["threshold"]):
-        line(row)
-    pause()
-    return state
-
-
-def set_queue(state):
-    clear()
-    banner()
-    title("排队自动预约")
-    line("当目标浴室的排队人数满足条件时，程序自动加入排队并跟踪排队结果。")
-    line("触发只取决于排队人数，与是否满员无关；队列越长说明排到得越晚，")
-    line("适合「现在不急着洗、先占个位」的用法。")
-    print()
-    enabled = confirm("是否启用排队自动预约", default_yes=bool(state.get("auto_queue")))
-    state["auto_queue"] = enabled
-    if enabled:
-        print()
-        line("当前设置：%s" % cond_text(state.get("queue_condition", "le"),
-                                       state.get("queue_threshold", 2), "排队人数"))
-        print()
-        choice = ask_choice("请选择排队规则", [
-            (1, "排队人数不超过 N 人时排队", "队列短、等得少"),
-            (2, "排队人数达到 N 人及以上时排队", "只有你指定的队列长度才排"),
-            (3, "排队人数恰好为 N 人时排队", ""),
-        ], 1)
-        while True:
-            raw = ask("N（0 表示「已满员但无人排队」时也排，立即轮到你）",
-                      default=str(state.get("queue_threshold", 2)))
-            try:
-                n = int(raw)
-            except ValueError:
-                line("请输入数字。")
-                continue
-            cond = {"1": "le", "2": "ge", "3": "eq"}[choice]
-            if n < 0:
-                line("N 不能为负数。")
-                continue
-            issue = cond_issue(cond, n, "排队人数")
-            if issue:
-                line("这样设置有问题：%s" % issue)
-                continue
-            state["queue_threshold"], state["queue_condition"] = n, cond
-            break
-        print()
-        while True:
-            raw = ask("排队最长等待时长（分钟，0 表示不限）", default=state.get("queue_max_wait_min", 0))
-            try:
-                state["queue_max_wait_min"] = int(raw)
-                break
-            except ValueError:
-                line("请输入数字。")
-    save_state(state)
-    if enabled:
-        out("排队自动预约已启用：%s" % cond_text(state["queue_condition"], state["queue_threshold"],
-                                               "排队人数"))
-    else:
-        out("排队自动预约已关闭")
-    pause()
-    return state
-
-
-def set_bath_plan(state, client):
-    clear()
-    banner()
-    title("洗澡时间计划")
-    line("设定计划洗澡时间后，程序只在「不会提前叫到你」的前提下动手：")
-    line("· 抢空位：只在 计划时间 − 到场准备 之后才抢（抢到就必须立刻过去）")
-    line("· 排队：只在 现在 + 预计等待 ≥ 计划时间 − 到场准备 时才排，宁可晚排")
-    print()
-    gender_now = state.get("gender", "auto")
-    if gender_now == "auto":
-        detected = "自动识别"
-        try:
-            bot = Bot(client, state)
-            gender_now = "未知" if not bot.user else ""
-        except Exception:
-            pass
-        line("当前：计划 %s ｜ 性别 自动识别 ｜ 预计用时 %s ｜ 到场准备 %s 分钟 ｜ 保守系数 %s"
-             % (state.get("target_time") or "未启用", state.get("avg_bath_minutes") or "按性别默认",
-                state.get("arrive_lead_min", 5), state.get("conservative_factor", 0.8)))
-    else:
-        line("当前：计划 %s ｜ 性别 %s ｜ 预计用时 %s ｜ 到场准备 %s 分钟 ｜ 保守系数 %s"
-             % (state.get("target_time") or "未启用", GENDER_TEXT.get(gender_now, gender_now),
-                state.get("avg_bath_minutes") or "按性别默认",
-                state.get("arrive_lead_min", 5), state.get("conservative_factor", 0.8)))
-    print()
-
-    while True:
-        raw = ask("计划开始洗澡时间 HH:MM（填 0 表示不启用时间计划）",
-                  default=state.get("target_time") or "0")
-        raw = raw.strip()
-        if raw in ("0", "无", "不启用", ""):
-            state["target_time"] = ""
-            break
-        try:
-            hh, mm = [int(x) for x in raw.replace("：", ":").split(":")[:2]]
-            if not (0 <= hh <= 23 and 0 <= mm <= 59):
-                raise ValueError
-            state["target_time"] = "%02d:%02d" % (hh, mm)
-            break
-        except ValueError:
-            line("格式不对，请按 HH:MM 填写，例如 21:30。")
-
-    if not state["target_time"]:
-        save_state(state)
-        out("已关闭时间计划：恢复为「按空闲条件/排队条件」判断")
-        pause()
-        return state
-
-    print()
-    choice = ask_choice("性别（用于取平均洗澡时长）", [
-        (1, "自动识别（从账号设置读取）", "推荐"),
-        (2, "男", ""),
-        (3, "女", ""),
-    ], 1 if (state.get("gender") or "auto") == "auto" else
-        (2 if state.get("gender") == "male" else 3))
-    state["gender"] = {"1": "auto", "2": "male", "3": "female"}[choice]
-    gender = "male" if choice == "2" else ("female" if choice == "3" else "auto")
-    if gender == "auto":
-        try:
-            gender = Bot(client, state).resolve_gender()
-            line("账号读取到的性别：%s" % GENDER_TEXT.get(gender, gender))
-        except Exception:
-            gender = "unknown"
-        if gender == "unknown":
-            line("账号里没有性别信息（保密），将按通用值估算；也可手动指定")
-
-    default_min = AVG_BATH_MINUTES.get(gender, 15)
-    while True:
-        raw = ask("每次洗澡预计用时（分钟）", default=str(state.get("avg_bath_minutes") or default_min))
-        try:
-            minutes = int(raw)
-            if minutes < 1 or minutes > 240:
-                line("请填 1~240 之间的分钟数。")
-                continue
-            state["avg_bath_minutes"] = minutes
-            break
-        except ValueError:
-            line("请输入数字。")
-
-    while True:
-        raw = ask("到场准备时间（分钟，从拿到位置到进浴室开门的时间）",
-                  default=str(state.get("arrive_lead_min", 5)))
-        try:
-            state["arrive_lead_min"] = max(0, min(60, int(raw)))
-            break
-        except ValueError:
-            line("请输入数字。")
-
-    while True:
-        raw = ask("保守系数（0.1~1.0，越小越保守＝越晚排队）",
-                  default=str(state.get("conservative_factor", 0.8)))
-        try:
-            factor = float(raw)
-            if not (0.1 <= factor <= 1.0):
-                line("请填 0.1~1.0 之间。")
-                continue
-            state["conservative_factor"] = factor
-            break
-        except ValueError:
-            line("请输入数字。")
-
-    while True:
-        raw = ask("超过计划时间多少分钟还没拿到位置就停止",
-                  default=str(state.get("give_up_min", 30)))
-        try:
-            state["give_up_min"] = max(1, int(raw))
-            break
-        except ValueError:
-            line("请输入数字。")
-
-    save_state(state)
-    try:
-        plan = Bot(client, state).plan()
-        ready = plan["target"] - timedelta(minutes=plan["lead"])
-        out("已保存：%s 开始洗（%s 分钟），不会早于 %s 拿到位置"
-            % (plan["target"].strftime("%H:%M"), plan["avg_min"], ready.strftime("%H:%M")))
-    except ApiError as e:
-        out("已保存，但时间设置有问题：%s" % e, "WARN")
     pause()
     return state
 
@@ -2071,9 +1809,8 @@ def screen_main(state, client):
                 print()
                 sub = ask_choice("请选择设置项", [
                     (1, "账号与密码", ""), (2, "目标浴室与设备类型", ""),
-                    (3, "空闲预约条件", ""), (4, "排队自动预约", ""),
-                    (5, "洗澡时间计划", ""), (6, "检测周期与结果通知", ""),
-                    (7, "启动方式修复", ""), (0, "返回", ""),
+                    (3, "定时预约设置", ""), (4, "检测周期与结果通知", ""),
+                    (5, "启动方式修复", ""), (0, "返回", ""),
                 ], 0)
                 if sub == "0":
                     break
@@ -2084,14 +1821,10 @@ def screen_main(state, client):
                         state["session"] = client.dump_session()
                         set_targets(state, client)
                 elif sub == "3":
-                    set_condition(state)
-                elif sub == "4":
-                    set_queue(state)
-                elif sub == "5":
                     set_bath_plan(state, client)
-                elif sub == "6":
+                elif sub == "4":
                     set_misc(state)
-                elif sub == "7":
+                elif sub == "5":
                     screen_open_with()
             continue
 
@@ -2194,48 +1927,55 @@ def monitor_flow(state, client):
 class SimClient:
     """自检用的模拟客户端：不联网，按脚本返回接口数据。
 
-    可模拟三种局面：有空位可预约、满员需排队、账号已有设备。
+    可模拟：有无空位、排队人数与站点预计等待、账号是否已有设备。
     """
 
-    def __init__(self, idle=0, queue_people=2, already_reserved=False):
+    def __init__(self, idle=0, wait_sec=240, queue_people=2, already_reserved=False):
         self.idle = idle
+        self.wait_sec = wait_sec
         self.queue_people = queue_people
         self.reserved = bool(already_reserved)
         self.queued = False
         self.q_polls = 0
         self.reserve_calls = 0
+        self.queue_calls = 0
 
     @staticmethod
     def _device_info():
-        return {"uuid": "dev-77", "deviceNumber": "77",
-                "deviceAreaName": "4号楼1层（男）", "reserveTime": 1789555000}
+        return {"uuid": "dev-77", "deviceNumber": "77", "deviceAreaName": "4号楼1层（男）",
+                "reserveTime": 1789555000, "device_type_key": "faucet"}
 
     def api(self, mod, act, data=None, retries=3):
         if act == "getUserInfo":
             return {"id": 1, "mobile": "13800000000", "user_nickname": "模拟账号",
-                    "available_balance": "0.00", "default_org_area_id": 105,
-                    "default_device_area_id": 12}
+                    "available_balance": "0.00", "sex": "1",
+                    "default_org_area_id": 105, "default_device_area_id": 12}
         if act == "getSetting":
             return {"checkBodyTemperature": "0", "enableDistributedEvent": "0"}
         if act == "selectDeviceTypeByOrgAreaId":
             return [{"device_type_key": "faucet", "device_type_name": "超级澡堂",
-                     "need_reserve": "1"}]
+                     "need_reserve": "1", "max_run_time": "3600", "max_reserve_times": "10"}]
         if act == "selectDeviceAreasWithDeviceState":
             return [{"device_area_id": 12, "device_area_name": "4号楼1层（男）",
-                     "idleNum": self.idle, "totalNum": 8}]
+                     "gender_limit": "male", "status": "1",
+                     "idleNum": self.idle, "totalNum": max(self.idle, 0) + 4}]
         if act == "selectDeviceAreas":
             return [{"device_area_id": 12, "device_area_name": "4号楼1层（男）"}]
         if act == "selectDevicesByAreaId":
             return [{"device_key": "dev-31", "device_name": "31", "device_status": "ready"}]
         if act == "exchangeMsg":
-            messages = [{"id": 1, "type": "waitingInfo",
+            devices = [{"uuid": "d%d" % i,
+                        "deviceStatus": "ready" if i < self.idle else "running"}
+                       for i in range(max(self.idle, 0) + 4)]
+            messages = [{"id": 0, "type": "deviceState", "content": devices},
+                        {"id": 1, "type": "waitingInfo",
                          "content": {"queuingNumber": self.queue_people,
-                                     "expectedWaitingTime": 240}}]
+                                     "expectedWaitingTime": self.wait_sec}}]
             if self.reserved:
                 name, device, queue = "reserved", self._device_info(), ""
             elif self.queued:
                 self.q_polls += 1
-                if self.q_polls >= 2:          # 排队一轮后排到位置
+                if self.q_polls >= 2:
                     self.reserved = True
                     name, device, queue = "reserved", self._device_info(), ""
                 else:
@@ -2247,9 +1987,16 @@ class SimClient:
                                          "queueInfo": queue, "remainTime": 120}})
             return messages
         if act == "queueUp":
+            self.queue_calls += 1
             self.queued = True
             return {"result": "queued", "queuingNumber": self.queue_people,
-                    "expectedWaitingTime": 240}
+                    "expectedWaitingTime": self.wait_sec}
+        if act == "cancelQueue":
+            self.queued = False
+            return {"result": 1}
+        if act == "cancelReserve":
+            self.reserved = False
+            return {"result": 1}
         if act == "reserve":
             self.reserve_calls += 1
             self.reserved = True
@@ -2260,40 +2007,40 @@ class SimClient:
         raise ApiError(-9, "模拟环境未定义接口 %s/%s" % (mod, act))
 
 
-def simulate_flow(idle, queue_people, already_reserved=False, expect="reserve",
-                  max_rounds=5, auto_reserve=True, reserve_rule=("le", 1)):
-    """在没有网络的情况下走一遍完整监控流程。
+def simulate_flow(idle, plan_min_away=3, lead=5, wait_sec=240, already_reserved=False,
+                  expect="reserve", max_rounds=6):
+    """在没有网络的情况下走一遍定时预约流程。
 
-    expect="reserve" 期望抢到空位；expect="queue" 期望加入排队；
-    expect="skip" 期望因为已有设备而放弃所有动作。
+    expect: reserve=抢到空位 / queue=排队后预约成功 / queue_early=提前排队但被叫到太早而自动取消
+            none=不做任何动作
     """
     global _LOG_DISABLED
     import contextlib
     import io
 
     class _Bot(Bot):
-        """加轮次上限，避免监控无限循环。"""
-
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.rounds = 0
 
-        def areas(self, retries=3):
+        def snapshot(self, target):
             self.rounds += 1
             if self.rounds > max_rounds:
                 raise KeyboardInterrupt("轮次上限")
-            return super().areas(retries=retries)
+            return super().snapshot(target)
 
+        def validate_plan(self, plan, row=None, types=None):
+            return True, []          # 合法性校验由单独的自检项覆盖，这里只测动作逻辑
+
+    target = datetime.now() + timedelta(minutes=plan_min_away)
     state = dict(DEFAULT_STATE)
     state.update({"account": "selftest", "password": "selftest", "device_type_key": "faucet",
                   "targets": [{"area_id": 12, "area_name": "4号楼1层（男）"}],
-                  "auto_reserve": auto_reserve,
-                  "condition": reserve_rule[0], "threshold": reserve_rule[1],
-                  "auto_queue": True,
-                  "queue_threshold": queue_people, "queue_condition": "le",
-                  "poll_interval": 3})
-    client = SimClient(idle=idle, queue_people=queue_people,
-                       already_reserved=already_reserved)
+                  "target_time": target.strftime("%H:%M"),
+                  "arrive_lead_min": lead, "conservative_factor": 0.8,
+                  "give_up_min": 120, "poll_interval": 1})
+    client = SimClient(idle=idle, wait_sec=wait_sec, already_reserved=already_reserved)
+
     previous = _LOG_DISABLED
     _LOG_DISABLED = True
     try:
@@ -2304,17 +2051,23 @@ def simulate_flow(idle, queue_people, already_reserved=False, expect="reserve",
             except KeyboardInterrupt:
                 done = "loop"
         text = buffer.getvalue()
+        result = {"done": done, "text": text, "client": client}
     except Exception as e:
         _LOG_DISABLED = previous
         out("模拟流程异常：%s" % e, "ERROR")
         return False
     _LOG_DISABLED = previous
 
-    if expect == "skip":
-        return client.reserve_calls == 0 and "预约成功" not in text
+    if expect == "reserve":
+        return result["done"] is True and "预约成功" in text
     if expect == "queue":
-        return client.queued and "排队成功" in text
-    return done is True and "预约成功" in text
+        return "排队成功" in text and "预约成功" in text
+    if expect == "queue_early":
+        return "排队成功" in text and "早于计划" in text
+    if expect == "none":
+        return (client.reserve_calls == 0 and client.queue_calls == 0
+                and "预约成功" not in text and "排队成功" not in text)
+    return False
 
 
 def self_test():
@@ -2365,14 +2118,40 @@ def self_test():
     checks.append(("登录状态保存与复用",
                    c2.restore_session(c1.dump_session()) and c2.session_id == "sample123"))
 
-    checks.append(("流程模拟：空位达到条件时抢空位", simulate_flow(idle=1, queue_people=2)))
-    checks.append(("流程模拟：满员时按排队人数排队", simulate_flow(idle=0, queue_people=2)))
-    checks.append(("流程模拟：有空位但关闭空闲预约时改为排队（不要求满员）",
-                   simulate_flow(idle=1, queue_people=2, auto_reserve=False, expect="queue")))
-    checks.append(("流程模拟：空位很多也照样按排队人数占位",
-                   simulate_flow(idle=6, queue_people=2, auto_reserve=False, expect="queue")))
-    checks.append(("流程模拟：已有预约时不重复操作",
-                   simulate_flow(idle=1, queue_people=2, already_reserved=True, expect="skip")))
+    checks.append(("流程模拟：到时间且有空位 → 直接抢位置",
+                   simulate_flow(idle=1, plan_min_away=3, lead=5, expect="reserve")))
+    checks.append(("流程模拟：到时间但满员 → 加入排队并排到",
+                   simulate_flow(idle=0, plan_min_away=3, lead=5, expect="queue")))
+    checks.append(("流程模拟：未到时间但预计等待够长 → 提前排队占位",
+                   simulate_flow(idle=3, plan_min_away=60, lead=5, wait_sec=5400,
+                                 expect="queue_early")))
+    checks.append(("流程模拟：未到时间且等待不足 → 不做任何动作",
+                   simulate_flow(idle=3, plan_min_away=60, lead=5, wait_sec=600,
+                                 expect="none")))
+    checks.append(("流程模拟：已有预约 → 不重复操作",
+                   simulate_flow(idle=1, plan_min_away=3, lead=5, already_reserved=True,
+                                 expect="none")))
+
+    sim = SimClient(idle=1)
+    check_bot = Bot(sim, dict(DEFAULT_STATE, device_type_key="faucet"))
+    check_bot.device_type_key = "faucet"
+    types = sim.api("DeviceAreaApi", "selectDeviceTypeByOrgAreaId")
+    area = normalize_areas(sim.api("DeviceAreaApi", "selectDeviceAreasWithDeviceState"))[0]
+    now = datetime.now()
+    plan_ok = {"raw": "x", "target": now + timedelta(minutes=30), "rolled": False,
+               "gender": "male", "avg_min": 10, "lead": 5, "factor": 0.8, "give_up": 30}
+    plan_late = dict(plan_ok, target=now + timedelta(minutes=2))      # 距到场准备只剩 2 分钟
+    plan_long = dict(plan_ok, avg_min=90)                             # 超过站点单次 60 分钟
+    plan_sex = dict(plan_ok, gender="female")                          # 浴室限男
+    ok_a, _ = check_bot.validate_plan(plan_ok, area, types)
+    ok_b, n_b = check_bot.validate_plan(plan_late, area, types)
+    ok_c, n_c = check_bot.validate_plan(plan_long, area, types)
+    ok_d, n_d = check_bot.validate_plan(plan_sex, area, types)
+    checks.append(("预约时间合法性校验（来不及 / 超时长 / 性别不符）",
+                   ok_a and not ok_b and not ok_c and not ok_d
+                   and any("来不及" in x for x in n_b)
+                   and any("最长" in x for x in n_c)
+                   and any("性别" in x for x in n_d)))
 
     checks.append(("条件退化识别（空闲 ≥ 0 属无条件）",
                    cond_issue("ge", 0, "空闲位置") is not None
@@ -2451,8 +2230,7 @@ def main():
         state["session"] = client.dump_session()
         save_state(state)
         set_targets(state, client)
-        set_condition(state)
-        set_queue(state)
+        set_bath_plan(state, client)
         set_misc(state)
         out("配置完成")
         pause("按回车进入主菜单")
