@@ -126,7 +126,7 @@ DEFAULT_STATE = {
     "org_area_id": None,
     "device_type_key": None,
     "device_type_name": "",
-    "targets": [],              # [{"area_id": 12, "area_name": "10#1层 (男)"}]
+    "targets": [],              # [{"area_id": 12, "area_name": "1号楼1层 (男)"}]
     "condition": "queue",       # 预约判断方式（三选一）：queue / plan / off
     "queue_min": 70,            # 条件① 排队人数阈值 M（≥）
     "target_time": "",          # 计划开始洗澡时间 "21:30"
